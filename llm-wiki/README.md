@@ -13,7 +13,7 @@ Three core operations, run against a user-designated directory:
 
 - **Ingest** — read a source (URL / PDF / pasted text / external raw directory), extract entities and concepts, create or update wiki pages, cross-link them, update `index.md` and `log.md`. A single source typically touches 5–15 wiki pages.
 - **Query** — synthesize an answer from existing wiki pages. Worthwhile answers get filed back as new `queries/` pages with a back-link from one of the source concept pages — so your explorations compound instead of disappearing into chat history.
-- **Lint** — programmatic health check: dead wikilinks, orphan pages, frontmatter violations, tags outside the taxonomy, stale content, source drift, log rotation. Implemented in `scripts/lint.sh`; agent reads its output and reports by severity.
+- **Lint** — programmatic health check: dead wikilinks, orphan pages, frontmatter violations, tags outside the taxonomy, stale content, source drift, log rotation. Implemented in `scripts/lint.py` (cross-OS Python 3); agent reads its output and reports by severity.
 
 Page types (all linked via `[[wikilinks]]`):
 
@@ -47,7 +47,7 @@ Raw sources can also live **outside** the wiki root — set `raw_source:` in `.w
 ### As a user-level Claude Code skill
 
 ```bash
-git clone https://github.com/mydreamhorse/llm-wiki-skill.git ~/.claude/skills/llm-wiki
+git clone https://github.com/magicjam-ai/magic-skills.git /tmp/magic-skills && cp -r /tmp/magic-skills/llm-wiki ~/.claude/skills/llm-wiki
 ```
 
 Restart Claude Code. The skill registers as `llm-wiki` and activates on triggers like `建个 wiki` / `初始化 wiki` / `编入 [源]` / `查 wiki` / `lint wiki`, or when you reference "my wiki / knowledge base / notes" in context.
@@ -57,7 +57,7 @@ Restart Claude Code. The skill registers as `llm-wiki` and activates on triggers
 If you use [`npx skills`][skills-cli]:
 
 ```bash
-npx skills add https://github.com/mydreamhorse/llm-wiki-skill.git -g -y
+npx skills add https://github.com/magicjam-ai/magic-skills.git -g -y
 ```
 
 ### Manual invocation
@@ -82,7 +82,7 @@ Then feed it sources. A single article typically updates 5–15 pages. Run `lint
 ## Linting
 
 ```bash
-bash scripts/lint.sh <wiki-root>
+python3 scripts/lint.py <wiki-root>
 ```
 
 Read-only scan. Reports, grouped by severity:
