@@ -16,9 +16,12 @@ API_KEY = os.environ.get("GETNOTE_API_KEY", "")
 CLIENT_ID = os.environ.get("GETNOTE_CLIENT_ID", "cli_a1b2c3d4e5f6789012345678abcdef90")
 BASE_URL = "https://openapi.biji.com"
 OUT_DIR = os.path.expanduser("~/obsidian/00_Inbox/Get笔记")
+AUDIO_OUT_DIR = os.path.expanduser("~/obsidian/00_Inbox/音频")
 ASSETS_DIR = os.path.join(OUT_DIR, "_assets", "Get笔记")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".getnote_sync_state.json")
 PROGRESS_FILE = "/tmp/openclaw/getnote-sync-progress.json"
+# llm-wiki 编译后的源文件存放目录（已消费的笔记不重新下载）
+WIKI_RAW_DIR = os.path.expanduser("~/obsidian/40_知识/wiki/raw/articles")
 
 CST = timezone(timedelta(hours=8))
 
@@ -28,6 +31,22 @@ MAX_WORKERS = 4  # 并发下载图片
 
 # 图片 URL 缓存（避免同一笔记重复下载）
 _url_cache = {}
+
+# 已消费笔记 ID 缓存（避免扫描目录多次）
+_consumed_ids = None
+
+
+def is_note_consumed(note_id_short):
+    """检查笔记是否已被 llm-wiki 消费（移入 wiki/raw/articles/）"""
+    global _consumed_ids
+    if _consumed_ids is None:
+        _consumed_ids = set()
+        if os.path.isdir(WIKI_RAW_DIR):
+            for f in os.listdir(WIKI_RAW_DIR):
+                if f.endswith(".md"):
+                    _consumed_ids.add(f)
+    # 文件名格式：2026-04-27 Title (note_id[:8]).md → 检查 note_id 片段
+    return any(note_id_short in f for f in _consumed_ids)
 
 
 def log(msg):
@@ -272,10 +291,20 @@ def note_to_md(note, image_paths=None):
     web_url = web_page.get("url", "")
     ref_content = note.get("ref_content", "") or ""
 
-    tag_str = " ".join(f"#{t}" for t in tags) if tags else ""
+    # 处理 tags：可能是字符串列表，也可能是 dict 列表（Get笔记 API 返回的是 dict 列表）
+    if tags:
+        processed = []
+        for t in tags:
+            if isinstance(t, dict):
+                processed.append(t.get("name", ""))
+            else:
+                processed.append(str(t))
+        tag_str = " ".join(f"#{name}" for name in processed if name)
+    else:
+        tag_str = ""
 
     lines = [f"---", f'title: "{title}"', f"date: {created}",
-             f"source: Get笔记", f"type: {note_type}", f'note_id: "{note_id}"']
+             f"source: Get笔记", f"source_type: {note_type}", f'note_id: "{note_id}"']
     if tag_str:
         lines.append(f"tags: {tag_str}")
     if web_url:
@@ -285,18 +314,25 @@ def note_to_md(note, image_paths=None):
     lines.append("")
 
     # 链接笔记：优先使用 web_page.content（原文），而非 AI 总结（content）
+    # AI 总结放在正文前
     if note_type == "link" and web_page.get("content"):
         body_content = web_page["content"]
+        if content and content.strip():
+            ai_summary_block = f"{content.strip()}\n\n---\n\n"
+        else:
+            ai_summary_block = ""
     elif ref_content:
         body_content = ref_content
+        ai_summary_block = ""
     else:
         body_content = content
+        ai_summary_block = ""
 
     if body_content:
-        lines.append(body_content)
+        lines.append(ai_summary_block + body_content)
 
-    # 嵌入图片
-    if image_paths:
+    # 嵌入图片（link 类型已在 body_content 中通过 download_and_replace_images 处理过，无需重复追加）
+    if image_paths and note_type != "link":
         for p in image_paths:
             if p:
                 lines.append(f"")
@@ -311,6 +347,10 @@ def note_to_md(note, image_paths=None):
 def write_note(note, out_dir):
     note_id = note.get("note_id", note.get("id", ""))
     created = note.get("created_at", "")[:10]
+
+    # 检查笔记是否已被 llm-wiki 消费（移入 wiki/raw/articles/）
+    if note_id and is_note_consumed(note_id[:8]):
+        return None, f"⏭️  跳过（已编入 wiki/raw/articles/）：{note.get('title', '')[:30]}"
 
     # 音频笔记转写未完成检查
     if note.get("note_type") == "recorder_audio":
@@ -359,8 +399,10 @@ def write_note(note, out_dir):
 
 
 def main():
-    global _url_cache
+    global _url_cache, _consumed_ids
+    _consumed_ids = None  # 重置已消费笔记缓存
     os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(AUDIO_OUT_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
     write_progress("running", synced=0, total=0)
 
@@ -416,7 +458,7 @@ def main():
                 created = n.get("created_at", "")[:10]
                 title = n.get("title", "无标题")[:40]
                 filename = f"{created} {title} ({nid[:8]}).md"
-                if not os.path.exists(os.path.join(OUT_DIR, filename)):
+                if not os.path.exists(os.path.join(OUT_DIR, filename)) and not os.path.exists(os.path.join(AUDIO_OUT_DIR, filename)):
                     filtered.append(n)
                     existing_note_ids.add(nid)
         log(f"🔍 本地过滤（>{cutoff[:19]}）：{len(filtered)} 条需要同步" + (f"（含 {len(skipped_ids)} 条重试）" if skipped_ids else ""))
@@ -435,6 +477,7 @@ def main():
 
     total = len(filtered)
     synced_ok = 0
+    consumed_this_run = 0  # 本轮因已编入 wiki 而跳过的笔记数
     # 追踪本次成功同步的笔记中最新那条的 created_at
     new_max_created = None
 
@@ -462,11 +505,16 @@ def main():
         except Exception as e:
             log(f"  [{completed}/{total}] ⚠️  详情失败: {e}")
 
-        ok, result = write_note(note, OUT_DIR)
+        ok, result = write_note(note, AUDIO_OUT_DIR if note.get("note_type") in ("recorder_audio", "audio") else OUT_DIR)
         if ok is None:
-            # 转写生成中，跳过且记录 ID（音频特殊处理会在后续同步中重试）
-            skipped_ids.discard(note.get("note_id", note.get("id", "")))  # 会被 still_skipped 重新收集
-            log(f"  [{completed}/{total}] {result}")
+            # 区分：已编入 wiki 跳过 vs 转写未完成跳过
+            nid = note.get("note_id", note.get("id", ""))
+            if "已编入 wiki" in result:
+                consumed_this_run += 1
+                log(f"  [{completed}/{total}] {result}")
+            else:
+                skipped_ids.discard(nid)  # 会被 still_skipped 重新收集
+                log(f"  [{completed}/{total}] {result}")
         elif ok:
             synced_ok += 1
             note_created = note.get("created_at", "")
@@ -503,10 +551,20 @@ def main():
             "last_synced_at": new_last_synced,
             "total_synced": (state.get("total_synced", 0) if state else 0) + synced_ok,
             "skipped_notes": still_skipped,
+            "consumed_notes": (state.get("consumed_notes", []) if state else []),
+            "consumed_total": (state.get("consumed_total", 0) if state else 0) + consumed_this_run,
         }
+        # 追加本轮被消费的笔记 ID
+        if consumed_this_run > 0:
+            for note in filtered:
+                nid = note.get("note_id", note.get("id", ""))
+                if nid and is_note_consumed(nid[:8]):
+                    if nid not in new_state["consumed_notes"]:
+                        new_state["consumed_notes"].append(nid)
         save_state(new_state)
-        log(f"\n✅ 同步完成：{synced_ok} 条笔记")
-        log(f"状态已更新：last_synced_at={new_last_synced}，累计 {new_state['total_synced']} 条")
+        consumed_total = new_state.get("consumed_total", 0)
+        log(f"\n✅ 同步完成：{synced_ok} 条笔记" + (f"，{consumed_this_run} 条已编入 wiki 跳过" if consumed_this_run > 0 else ""))
+        log(f"状态已更新：last_synced_at={new_last_synced}，累计 {new_state['total_synced']} 条，已消费 {consumed_total} 条")
     else:
         log(f"\n[dry-run] 本次模拟同步 {synced_ok} 条")
 
