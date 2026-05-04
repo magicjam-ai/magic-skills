@@ -1,3 +1,8 @@
+---
+name: getnote-sync
+description: "将 Get笔记 笔记增量或全量同步到 Obsidian；当用户说“笔记同步”“同步 Get笔记”“全量同步”或需要把 Get笔记链接、图片、录音笔记落到 Obsidian Inbox 时使用。"
+---
+
 # Get笔记同步
 
 将 Get笔记 的笔记增量同步到 Obsidian `00_Inbox/Get笔记/` 目录。
@@ -7,12 +12,14 @@
 当用户说"笔记同步"或要求同步 Get 笔记时，执行：
 
 ```bash
-python3 /Users/robert/.agents/skills/getnote-sync/scripts/getnote-sync.py
+python3 scripts/getnote-sync.py
 ```
 
+执行命令时，将工作目录设为本 `SKILL.md` 所在目录（即包含 `scripts/getnote-sync.py` 的目录）。
+
 环境变量：
-- `GETNOTE_API_KEY=gk_live_273bc224d1fd0aa5.d356b96bbdebb1f02910efae338d194e5bb06900e6325063`
-- `GETNOTE_CLIENT_ID=cli_a1b2c3d4e5f6789012345678abcdef90`
+- `GETNOTE_API_KEY`：必填，从 Get笔记开放平台获取；未配置时先要求用户提供或配置，不要把密钥写入 `SKILL.md`。
+- `GETNOTE_CLIENT_ID`：可选；未配置时脚本使用默认 CLI client id。
 
 ## 可选参数
 

@@ -1,9 +1,6 @@
 ---
 name: llm-wiki
-description: "Karpathy 风格 LLM Wiki — 在任意 Markdown 目录里增量编译交叉链接的知识库。触发：'建个 wiki'、'初始化 wiki'、'编入 [源]'、'查 wiki'、'lint wiki'，或用户引用他们的 wiki/knowledge base/notes。基于 https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f，改造自 NousResearch/hermes-agent 的 llm-wiki skill 以在 Claude Code 里原生执行。"
-version: 1.0.0
-author: magic-skills (adapted from NousResearch/hermes-agent llm-wiki 2.1.0 for Claude Code)
-license: MIT
+description: "Karpathy 风格 LLM Wiki：在任意 Markdown 目录里增量编译交叉链接的知识库。Use when the user wants to create or initialize a wiki, ingest URLs/files/pasted text into a wiki, query an existing wiki, lint/audit a wiki, or refers to their wiki, knowledge base, or notes."
 ---
 
 # Karpathy's LLM Wiki（Claude Code 版）
@@ -145,7 +142,7 @@ Read file_path="<wiki-root>/log.md"   # 读尾部；必要时用 offset
 
 ### SCHEMA.md 模板
 
-```markdown
+````markdown
 # Wiki Schema
 
 ## Domain
@@ -220,7 +217,7 @@ sha256: <body 部分的 hex digest>
 2. 若真有矛盾，标注双方立场、日期、源
 3. frontmatter 里标 `contradictions: [page-name]`
 4. lint 报告里 flag 以供用户 review
-```
+````
 
 ### index.md 模板
 
@@ -359,8 +356,8 @@ Grep pattern="<EntityName>" path="<wiki-root>" glob="*.md"
 参考脚本见 `scripts/lint.py`（相对本 skill 目录）。调用方式：
 
 ```bash
-python3 ~/.claude/skills/llm-wiki/scripts/lint.py <wiki-root>
-# 例：python3 ~/.claude/skills/llm-wiki/scripts/lint.py docs/research-wiki
+python3 scripts/lint.py <wiki-root>
+# 例：python3 scripts/lint.py docs/research-wiki
 ```
 
 该脚本**只读扫描**，输出人类可读的分类报告；Agent 应读取输出、按严重度（死链 > 孤立 > drift > 矛盾 > 陈旧 > 样式）重新组织后汇报给用户，并 append log.md 条目。
