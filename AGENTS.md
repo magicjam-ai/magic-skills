@@ -6,7 +6,7 @@ This repository is a collection of installable agent skills. Each top-level skil
 
 - `llm-wiki/`: Claude Code skill for maintaining Markdown knowledge bases. Includes `SKILL.md`, `README.md`, and `scripts/lint.py`.
 - `getnote-sync/`: Codex skill for syncing Getnote notes into Obsidian. Includes `SKILL.md` and `scripts/getnote-sync.py`.
-- `inbox-dispatch/`: Obsidian inbox routing skill. Rules live in `scripts/dispatch_rules.json`; the dispatcher is `scripts/dispatch.py`.
+- `inbox-dispatch/`: Obsidian inbox routing skill. Classification rules in `scripts/dispatch_rules.json`; scanner is `scripts/scanner.py`; mover is `scripts/mover.py`. Claude Code does semantic classification (Pattern B).
 
 Keep new skills in their own directory with a root `SKILL.md`. Put helper programs in `scripts/` and small static fixtures or assets beside the skill that owns them.
 
@@ -17,10 +17,12 @@ There is no repository-wide build step. Validate the specific skill you changed:
 ```bash
 python3 -m py_compile llm-wiki/scripts/lint.py
 python3 -m py_compile getnote-sync/scripts/getnote-sync.py
-python3 -m py_compile inbox-dispatch/scripts/dispatch.py
+python3 -m py_compile inbox-dispatch/scripts/scanner.py
+python3 -m py_compile inbox-dispatch/scripts/mover.py
 python3 llm-wiki/scripts/lint.py <wiki-root>
 python3 getnote-sync/scripts/getnote-sync.py --dry-run
-python3 inbox-dispatch/scripts/dispatch.py --dry-run --since-days=3
+python3 inbox-dispatch/scripts/scanner.py --since-days 3
+python3 inbox-dispatch/scripts/mover.py <plan.json> --dry-run
 ```
 
 Run skill commands from the skill directory when the `SKILL.md` says so, especially for scripts that store state relative to their own path.

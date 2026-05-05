@@ -1,4 +1,16 @@
-{
-  "obsidian": "10_思考/待处理/obsidian",
-  "高考": "10_思考/待处理/高考"
-}
+[
+  {
+    "id": "obsidian",
+    "name": "Obsidian 使用",
+    "description": "关于 Obsidian 笔记应用的使用技巧、插件推荐、配置方法、主题定制等",
+    "destination": "10_思考/待处理/obsidian",
+    "hints": ["obsidian", "插件", "dataview", "模板"]
+  },
+  {
+    "id": "gaokao",
+    "name": "高考",
+    "description": "高考备考、考试政策、志愿填报、大学选择等相关内容",
+    "destination": "10_思考/待处理/高考",
+    "hints": ["高考", "招生", "备考", "志愿"]
+  }
+]
