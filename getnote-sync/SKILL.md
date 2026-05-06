@@ -20,6 +20,7 @@ python3 scripts/getnote-sync.py
 环境变量：
 - `GETNOTE_API_KEY`：必填，从 Get笔记开放平台获取；未配置时先要求用户提供或配置，不要把密钥写入 `SKILL.md`。
 - `GETNOTE_CLIENT_ID`：可选；未配置时脚本使用默认 CLI client id。
+- Robert 本机约定：若 shell 环境变量未设置，脚本会自动尝试读取 `~/.agents/skills/getnote/.local/credentials.env`（本机私有凭证文件，不要提交或发布）。
 
 ## 可选参数
 

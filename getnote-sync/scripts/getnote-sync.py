@@ -12,6 +12,31 @@ import json, urllib.request, urllib.error, re, os, sys, time, hashlib
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
 
+def load_getnote_local_credentials():
+    """Load credentials from the Get笔记 skill local env file when shell env is unset."""
+    candidates = [
+        os.path.expanduser("~/.agents/skills/getnote/.local/credentials.env"),
+        os.path.expanduser("~/.codex/skills/getnote/.local/credentials.env"),
+        os.path.expanduser("~/.Codex/skills/getnote/.local/credentials.env"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("\"").strip("'")
+                if key.startswith("GETNOTE_") and key not in os.environ:
+                    os.environ[key] = value
+        break
+
+
+load_getnote_local_credentials()
+
 API_KEY = os.environ.get("GETNOTE_API_KEY", "")
 CLIENT_ID = os.environ.get("GETNOTE_CLIENT_ID", "cli_a1b2c3d4e5f6789012345678abcdef90")
 BASE_URL = "https://openapi.biji.com"
