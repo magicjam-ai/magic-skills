@@ -1,16 +1,307 @@
-[
-  {
-    "id": "obsidian",
-    "name": "Obsidian 使用",
-    "description": "关于 Obsidian 笔记应用的使用技巧、插件推荐、配置方法、主题定制等",
-    "destination": "10_思考/待处理/obsidian",
-    "hints": ["obsidian", "插件", "dataview", "模板"]
-  },
-  {
-    "id": "gaokao",
-    "name": "高考",
-    "description": "高考备考、考试政策、志愿填报、大学选择等相关内容",
-    "destination": "10_思考/待处理/高考",
-    "hints": ["高考", "招生", "备考", "志愿"]
-  }
-]
+{
+  "pending_root": "10_思考/待处理",
+  "fallback_queue": "待判定",
+  "trash_queue": "淘汰候选",
+  "queue_metadata": [
+    {
+      "id": "ai-workbench",
+      "name": "AI工作台",
+      "description": "AI 操作系统、团队/个人工作台、工作流集成、知识自动化、效率平台、AI 工具链组合。",
+      "include": [
+        "AI工作台",
+        "AI操作系统",
+        "个人AI操作系统",
+        "团队AI",
+        "工作流集成",
+        "知识自动化",
+        "效率平台",
+        "工具链",
+        "AutoCLI",
+        "NotebookLM",
+        "Hermes + NotebookLM",
+        "微信同步",
+        "AI生产力系统"
+      ],
+      "exclude": [
+        "单纯模型新闻",
+        "纯安装教程",
+        "泛泛工具盘点",
+        "标题党"
+      ]
+    },
+    {
+      "id": "ai-evaluation-optimization",
+      "name": "AI测评和优化",
+      "description": "AI 系统/模型/Agent 的评测、基准测试、验证闭环、质量优化、提示词/流程优化、自动化评估与改进。",
+      "include": [
+        "AI测评",
+        "AI评测",
+        "模型评测",
+        "Agent评测",
+        "benchmark",
+        "eval",
+        "evaluation",
+        "优化",
+        "验证闭环",
+        "质量评估",
+        "自动评测",
+        "测试集",
+        "通过率",
+        "对齐",
+        "SFT",
+        "RL",
+        "prompt optimization"
+      ],
+      "exclude": [
+        "普通工具推荐",
+        "纯模型新闻",
+        "高考测评",
+        "个人效率复盘"
+      ]
+    },
+    {
+      "id": "knowledge-graph",
+      "name": "知识图谱",
+      "description": "知识图谱、Ontology、本体工程、GraphRAG、数据治理、企业知识工程、语义层。",
+      "include": [
+        "知识图谱",
+        "Knowledge Graph",
+        "GraphRAG",
+        "Graph RAG",
+        "本体",
+        "Ontology",
+        "ontology",
+        "本体工程",
+        "数据治理",
+        "语义层",
+        "语义操作系统",
+        "Graphify",
+        "Graphiti",
+        "Rowboat",
+        "Cognee",
+        "Palantir",
+        "企业知识工程"
+      ],
+      "exclude": [
+        "纯 Obsidian 使用技巧",
+        "普通笔记法",
+        "个人 inbox 流程"
+      ]
+    },
+    {
+      "id": "agent-harness",
+      "name": "Agent Harness",
+      "description": "Harness Engineering、Agent 运行时、Skill、MCP、Hooks、Subagent、Claude Code / Codex 工程化、OpenClaw/Hermes 运行机制。",
+      "include": [
+        "Agent Harness",
+        "Harness Engineering",
+        "Harness",
+        "Skill",
+        "Skills",
+        "MCP",
+        "Hooks",
+        "Subagent",
+        "sub-agent",
+        "Claude Code",
+        "Codex",
+        "OpenClaw",
+        "Hermes Agent",
+        "Agent SDK",
+        "运行时",
+        "命令中心",
+        "Gateway",
+        "工具调用"
+      ],
+      "exclude": [
+        "纯产品宣传",
+        "浅层工具盘点",
+        "只讲 prompt 技巧",
+        "高考志愿"
+      ]
+    },
+    {
+      "id": "ai-autonomous-development",
+      "name": "AI自主开发",
+      "description": "自进化 Agent、AI coding、自动研发系统、长期任务执行、自动测试/评测、从 idea 到代码/论文的自动化。",
+      "include": [
+        "AI自主开发",
+        "自动研发",
+        "自进化",
+        "self-evolving",
+        "self-improvement",
+        "AI coding",
+        "Vibe Coding",
+        "Coding Agent",
+        "自动测试",
+        "自动评测",
+        "从 idea 到代码",
+        "idea to paper",
+        "AutoResearch",
+        "长任务",
+        "长期任务",
+        "自主执行",
+        "自动迭代"
+      ],
+      "exclude": [
+        "普通 AI 编程入门",
+        "低质量 prompt 技巧",
+        "只讲工具安装"
+      ]
+    },
+    {
+      "id": "obsidian",
+      "name": "obsidian",
+      "description": "Obsidian 插件、配置、剪藏、同步、模板、Dataview、Vault 运维，以及 Obsidian 与 AI 的具体工具实践。",
+      "include": [
+        "Obsidian",
+        "Dataview",
+        "Templater",
+        "Web Clipper",
+        "插件",
+        "Vault",
+        "Markdown",
+        "双链",
+        "剪藏",
+        "同步",
+        "Custom Attachment Location",
+        "Claude Code 实践手记"
+      ],
+      "exclude": [
+        "抽象个人知识管理方法论",
+        "企业知识图谱",
+        "纯 AI Agent 架构"
+      ]
+    },
+    {
+      "id": "personal-productivity",
+      "name": "个人效率",
+      "description": "个人效率、时间管理、任务管理、信息输入输出效率、工具使用方法、个人生产力系统。",
+      "include": [
+        "个人效率",
+        "效率",
+        "时间管理",
+        "任务管理",
+        "GTD",
+        "生产力",
+        "工作流",
+        "效率工具",
+        "习惯",
+        "复盘",
+        "日程"
+      ],
+      "exclude": [
+        "组织级 AI 工作台",
+        "深度技术研究",
+        "高考志愿"
+      ]
+    },
+    {
+      "id": "personal-second-brain",
+      "name": "个人第二大脑",
+      "description": "个人第二大脑、llm-wiki、PKM、Zettelkasten、个人知识管理、Inbox 工作流、记忆系统、个人 AI 外脑。",
+      "include": [
+        "个人第二大脑",
+        "第二大脑",
+        "llm-wiki",
+        "LLM Wiki",
+        "PKM",
+        "Zettelkasten",
+        "Inbox",
+        "信息工作流",
+        "个人知识管理",
+        "知识管理",
+        "笔记",
+        "MOC",
+        "AI外脑",
+        "长期记忆",
+        "记忆系统",
+        "知识复利"
+      ],
+      "exclude": [
+        "企业知识图谱落地细节",
+        "纯 Obsidian 插件教程",
+        "普通效率工具罗列"
+      ]
+    },
+    {
+      "id": "personal-record",
+      "name": "个人记录",
+      "description": "个人生活记录、随想、聊天记录、旅行、家庭、非项目化备忘与日常记录。",
+      "include": [
+        "个人记录",
+        "日记",
+        "随想",
+        "聊天",
+        "闲聊",
+        "旅行",
+        "生活",
+        "家庭",
+        "备忘",
+        "记录",
+        "游玩"
+      ],
+      "exclude": [
+        "高考志愿决策",
+        "正式项目",
+        "技术专题研究"
+      ]
+    },
+    {
+      "id": "gaokao",
+      "name": "高考",
+      "description": "高考、强基计划、院校专业、招生政策、志愿填报、女儿升学决策相关材料。",
+      "include": [
+        "高考",
+        "强基计划",
+        "招生",
+        "院校",
+        "专业",
+        "志愿填报",
+        "选科",
+        "录取",
+        "分数线",
+        "大学",
+        "高中",
+        "升学",
+        "报考",
+        "985",
+        "211"
+      ],
+      "exclude": [
+        "普通教育新闻",
+        "泛泛学习方法",
+        "非升学相关个人记录"
+      ]
+    },
+    {
+      "id": "needs-review",
+      "name": "待判定",
+      "description": "低置信度或主题边界不清的材料。只有在无法稳定归入其他目录时使用。",
+      "include": [],
+      "exclude": []
+    },
+    {
+      "id": "trash-candidate",
+      "name": "淘汰候选",
+      "description": "重复、浅层、营销、标题党、低价值材料，等待 Robert 确认后归档或删除。",
+      "include": [
+        "保姆级教程",
+        "神器",
+        "盘点",
+        "安装教程",
+        "入门指南",
+        "一文看懂",
+        "全网爆火",
+        "震撼",
+        "必看",
+        "收藏",
+        "免费领取"
+      ],
+      "exclude": [
+        "原始英文源",
+        "高价值深度分析",
+        "项目强相关"
+      ]
+    }
+  ]
+}
