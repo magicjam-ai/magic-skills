@@ -118,13 +118,13 @@ def validate(plan_path, plan):
             src_name = Path(source).name
             target = VAULT / dest / src_name
             if target.exists():
-                errors.append({
+                warnings.append({
                     "index": i,
                     "source": source,
                     "destination": dest,
                     "target": str(target.relative_to(VAULT)),
                     "code": "target_exists",
-                    "message": "目标文件已存在，执行时会跳过或冲突",
+                    "message": "目标文件已存在；按 inbox-dispatch 规则，执行时会删除 00_Inbox 中的重复源笔记",
                 })
 
     return {

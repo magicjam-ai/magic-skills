@@ -20,6 +20,8 @@ import json
 import shutil
 import argparse
 import re
+import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from queue_config import VAULT, resolve_queue_destination, queue_by_name, pending_root_rel
@@ -63,6 +65,79 @@ def resolve_destination(item):
     if Path(dest_rel).is_absolute():
         return None, dest_rel
     return VAULT / dest_rel, dest_rel
+
+
+def capture_file_times(path):
+    """Capture timestamps before moving a note.
+
+    Robert reads Inbox/待处理 notes sorted newest-to-oldest by creation time.
+    Moving by copy/delete, or rewriting Get笔记 image links after a move, can
+    make notes look newly-created/modified and destroy that reading order.
+
+    On macOS, ``st_birthtime`` is the Finder/Obsidian-visible creation time.
+    Python can restore atime/mtime directly; birthtime needs ``SetFile``.
+    """
+    st = path.stat()
+    return {
+        "atime_ns": st.st_atime_ns,
+        "mtime_ns": st.st_mtime_ns,
+        "birthtime": getattr(st, "st_birthtime", None),
+    }
+
+
+def _setfile_date(ts):
+    return datetime.fromtimestamp(ts).strftime("%m/%d/%Y %H:%M:%S")
+
+
+def restore_file_times(path, times):
+    """Best-effort restore of creation and modified/access times.
+
+    ``ctime`` (inode status-change time) cannot be preserved on POSIX and will
+    still change when a file is renamed or metadata is updated. We preserve the
+    user-facing macOS birthtime when possible, and always restore mtime/atime.
+
+    Returns a list of warning strings.
+    """
+    warnings = []
+
+    birthtime = times.get("birthtime")
+    if birthtime is not None and sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["SetFile", "-d", _setfile_date(birthtime), str(path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as e:
+            warnings.append(f"创建时间恢复失败: {path.name}: {e}")
+
+    try:
+        os.utime(path, ns=(times["atime_ns"], times["mtime_ns"]))
+    except Exception as e:
+        warnings.append(f"修改时间恢复失败: {path.name}: {e}")
+
+    return warnings
+
+
+def move_note_preserving_file_times(src, dest):
+    """Move a Markdown note while preserving user-facing timestamps.
+
+    Prefer ``os.rename`` over ``shutil.move`` so same-volume moves preserve the
+    original inode and macOS birthtime. If a cross-device move ever occurs, use
+    copy2+unlink and then restore timestamps explicitly.
+    """
+    times = capture_file_times(src)
+    try:
+        os.rename(src, dest)
+    except OSError as e:
+        if getattr(e, "errno", None) != 18:  # EXDEV: cross-device link
+            raise
+        shutil.copy2(src, dest)
+        restore_file_times(dest, times)
+        src.unlink()
+    return times
 
 
 def process_getnote_attachments(md_path):
@@ -150,6 +225,23 @@ def cleanup_unreferenced_central_assets(central_sources):
     return removed
 
 
+def collect_getnote_central_sources(md_path):
+    """Collect central Get笔记 image files referenced by a note before deletion."""
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return set()
+
+    sources = set()
+    for m in re.finditer(r'!\[[^\]]*\]\(_assets/Get笔记/([^\)]+)\)', text):
+        filename = Path(m.group(1).strip()).name
+        sources.add(GETNOTE_ASSET_DIR / filename)
+    for m in re.finditer(r'!\[\[00_Inbox/Get笔记/_assets/Get笔记/([^\]]+)\]\]', text):
+        filename = Path(m.group(1).strip()).name
+        sources.add(GETNOTE_ASSET_DIR / filename)
+    return sources
+
+
 def execute():
     args = parse_args()
     if args.execute and args.dry_run:
@@ -171,12 +263,14 @@ def execute():
         return
 
     moved = 0
-    skipped_conflict = 0
+    deleted_duplicate_sources = 0
     skipped_missing = 0
     skipped_invalid = 0
     total_rewritten = 0
     total_copied = 0
     total_missing_assets = 0
+    total_time_restored = 0
+    time_restore_warnings = []
     central_sources_for_cleanup = set()
 
     for item in dispatches:
@@ -196,8 +290,13 @@ def execute():
             continue
 
         if dest.exists():
-            print(f"⏭️  跳过（目标已存在）: {source_rel} -> {dest_rel}")
-            skipped_conflict += 1
+            if dry:
+                print(f"[DRY-RUN] 目标已存在，将删除 00_Inbox 重复源笔记: {source_rel} -> {dest_rel}")
+            else:
+                central_sources_for_cleanup.update(collect_getnote_central_sources(src))
+                src.unlink()
+                print(f"🗑️  已删除重复源笔记（目标已存在）: {source_rel} -> {dest_rel}")
+            deleted_duplicate_sources += 1
             continue
 
         category = item.get("category_id", "")
@@ -210,8 +309,10 @@ def execute():
             print(f"[DRY-RUN] 将移动: {source_rel} -> {dest_rel}{suffix}")
         else:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dest))
+            original_times = move_note_preserving_file_times(src, dest)
             rewritten, copied, missing_assets, central_sources = process_getnote_attachments(dest)
+            time_restore_warnings.extend(restore_file_times(dest, original_times))
+            total_time_restored += 1
             total_rewritten += rewritten
             total_copied += copied
             total_missing_assets += missing_assets
@@ -240,9 +341,14 @@ def execute():
         print(f"图片链接改写: {total_rewritten} 处")
         print(f"图片迁移到笔记本地 assets: {total_copied} 个")
         print(f"源目录缺失图片: {total_missing_assets} 个")
+        print(f"已恢复笔记创建/修改时间: {total_time_restored} 条")
+        if time_restore_warnings:
+            print(f"时间恢复警告: {len(time_restore_warnings)} 条")
+            for warning in time_restore_warnings[:5]:
+                print(f"  - {warning}")
         print(f"已清理无旧引用的中央图片: {removed_central} 个")
-    if skipped_conflict:
-        print(f"跳过（目标已存在）: {skipped_conflict} 条")
+    if deleted_duplicate_sources:
+        print(f"{'将删除' if dry else '已删除'}重复源笔记（目标已存在）: {deleted_duplicate_sources} 条")
     if skipped_missing:
         print(f"跳过（源文件消失）: {skipped_missing} 条")
     if skipped_invalid:
