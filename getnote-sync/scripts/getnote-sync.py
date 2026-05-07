@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Get笔记增量同步脚本 v4（支持图片附件）
+Get笔记增量同步脚本 v5（纯增量模式）
 - 增量策略：记录「上次同步到的最新笔记时间」，下次只同步该时间之后的笔记
 - API 总是从 since_id=0 全量拉取（在本地过滤时间戳）
 - img_text 类型笔记：下载图片附件到本地，嵌入 markdown
-- 支持 --full 强制全量
+- 纯增量：不再支持 --full 全量同步，首次同步默认拉最近 7 天
 - 支持 --dry-run 预览
+- 自动创建输出目录（inbox-dispatch 可能清空并删除目录）
 """
 
 import json, urllib.request, urllib.error, re, os, sys, time, hashlib
@@ -51,7 +52,6 @@ WIKI_RAW_DIR = os.path.expanduser("~/obsidian/40_知识/wiki/raw/articles")
 CST = timezone(timedelta(hours=8))
 
 DRY_RUN = "--dry-run" in sys.argv
-FULL_SYNC = "--full" in sys.argv
 MAX_WORKERS = 4  # 并发下载图片
 
 # 图片 URL 缓存（避免同一笔记重复下载）
@@ -439,20 +439,19 @@ def main():
     # 记录本次同步开始时间，用于 cutoff（只在有笔记同步成功时才用）
     sync_start_time = datetime.now(CST).isoformat()
 
-    if FULL_SYNC:
-        cutoff = None
-        log("🔄 全量同步模式（--full）")
-    elif state and state.get("last_synced_at"):
+    if state and state.get("last_synced_at"):
         cutoff = state["last_synced_at"]
         total_prev = state.get("total_synced", 0)
         log(f"📡 增量同步模式，cutoff={cutoff}（上次共同步 {total_prev} 条）")
         if skipped_ids:
             log(f"🔄 待重试的跳过笔记：{len(skipped_ids)} 条")
     else:
-        cutoff = None
-        log("📡 首次同步，自动全量同步")
+        # 首次同步：默认只拉最近 7 天，避免意外全量
+        cutoff_dt = datetime.now(CST) - timedelta(days=7)
+        cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        log(f"📡 首次同步，默认同步最近 7 天（cutoff={cutoff}）")
 
-    log("\n开始拉取所有笔记（since_id=0，全量）...")
+    log("\n开始拉取所有笔记（since_id=0，拉取后按增量过滤）...")
     write_progress("fetching_list", synced=0, total=0)
     all_notes = fetch_all_notes()
     log(f"📋 API 返回共 {len(all_notes)} 条笔记")
@@ -487,9 +486,6 @@ def main():
                     filtered.append(n)
                     existing_note_ids.add(nid)
         log(f"🔍 本地过滤（>{cutoff[:19]}）：{len(filtered)} 条需要同步" + (f"（含 {len(skipped_ids)} 条重试）" if skipped_ids else ""))
-    else:
-        filtered = all_notes
-        log(f"🔍 全量模式：{len(filtered)} 条全部同步")
 
     if not filtered:
         log("没有新笔记需要同步 ✅")
