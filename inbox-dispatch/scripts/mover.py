@@ -4,13 +4,14 @@ inbox-dispatch mover: execute a reviewed dispatch plan.
 
 Safety policy:
   - Default is DRY-RUN.
-  - Actual moves require --execute after Robert confirms the plan.
+  - Actual moves require --execute after the plan has passed the required
+    mechanical + LLM review workflow in SKILL.md.
   - When moving Get笔记 Markdown, move/copy referenced images into the note's
     Custom Attachment Location folder: ./assets/${noteFileName}/
 
 用法：
   python3 scripts/mover.py plan.json             # 预览，不实际移动
-  python3 scripts/mover.py plan.json --execute   # 确认后执行移动
+  python3 scripts/mover.py plan.json --execute   # plan 验收通过后执行移动
 """
 
 import os
@@ -30,7 +31,7 @@ SPECIAL_CHARS = set('#^[]|*\\<>:?/')
 def parse_args():
     p = argparse.ArgumentParser(description="执行 inbox dispatch plan；默认只预览")
     p.add_argument("plan_file", help="dispatch plan JSON 文件路径")
-    p.add_argument("--execute", action="store_true", help="实际移动文件。仅在 Robert 确认后使用")
+    p.add_argument("--execute", action="store_true", help="实际移动文件。仅在 plan 经过机械校验和大模型验收后使用")
     p.add_argument("--dry-run", action="store_true", help="兼容旧用法；显式预览，不实际移动")
     return p.parse_args()
 
@@ -249,7 +250,7 @@ def execute():
 
     if dry:
         print(f"\n当前待处理根目录: {pending_root_rel()}")
-        print("如 Robert 确认无误，再运行：")
+        print("如 plan 已完成机械校验和大模型验收且满足执行阈值，再运行：")
         print(f"python3 scripts/mover.py {plan_path} --execute")
 
 

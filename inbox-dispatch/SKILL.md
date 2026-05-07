@@ -1,13 +1,13 @@
 ---
 name: inbox-dispatch
-description: '将 Obsidian 00_Inbox 下的 Markdown 笔记按 Robert 当前 10_思考/待处理 队列做语义预分拣，并生成可审核 dispatch plan。Use when the user asks to dispatch, organize, sort, or clean up their inbox notes, especially phrases like “分拣 inbox”, “整理 inbox”, or “inbox dispatch”.'
+description: '将 Obsidian 00_Inbox 下的 Markdown 笔记按 Robert 当前 10_思考/待处理 队列做语义预分拣，生成 dispatch plan，经大模型慎重验收后按错误阈值自动执行或请求确认。Use when the user asks to dispatch, organize, sort, or clean up their inbox notes, especially phrases like “分拣 inbox”, “整理 inbox”, or “inbox dispatch”.'
 ---
 
 # inbox-dispatch
 
-将 `00_Inbox/` 下的 Markdown 笔记按 Robert 当前工作流做**语义预分拣**，输出可审核的 dispatch plan。
+将 `00_Inbox/` 下的 Markdown 笔记按 Robert 当前工作流做**语义预分拣**，输出 dispatch plan，并在大模型慎重验收后按阈值执行或请求确认。
 
-**核心原则**：不使用单个关键词全文匹配直接移动；必须 plan / dry-run first，给出分类、理由、置信度，Robert 确认后才执行移动。
+**核心原则**：不使用单个关键词全文匹配直接移动；必须先生成 plan，再由大模型慎重验收并修正。若验收发现错误数 `> 5`，暂停并请 Robert 确认；若错误数 `<= 5`，修正后可直接执行移动。
 
 ---
 
@@ -36,8 +36,8 @@ python3 scripts/list_queues.py --format markdown
 
 ## 强制安全规则
 
-1. **未经 Robert 确认，不执行实际移动。**
-2. **默认只生成 plan 和 dry-run。**
+1. **未经 plan 生成与大模型验收，不执行实际移动。**
+2. **验收错误数阈值为 5。** 错误数 `> 5` 必须暂停并请 Robert 确认；错误数 `<= 5` 时，修正 plan 后可 dry-run 校验并直接执行。
 3. **不要使用单个关键词全文匹配决定分类。** 文件名、标题、小标题的权重大于正文偶然关键词。
 4. **低置信度进入 `fallback_queue`。** 不要强行归入主题队列。
 5. **疑似重复、浅层、营销进入 `trash_queue`。** 不要直接删除。
@@ -155,46 +155,121 @@ Plan 格式：
 - 也可用 `destination_queue` / `category_name` 让 `mover.py` 动态解析队列，但推荐仍写入完整 `destination`，方便审阅。
 - 不要删除文件；淘汰只移动到 `trash_queue` 等待确认。
 
-### Step 5：先 dry-run 给 Robert 审核
+### Step 5：大模型慎重验收 plan（强制）
+
+生成 plan 后，不要立刻移动。必须先进行两层验收：
+
+#### 5.1 机械验收
 
 ```bash
-python3 scripts/mover.py ~/obsidian/00_Inbox/_dispatch_logs/plan_YYYY-MM-DD_HHMM.json --dry-run
+python3 scripts/validate_plan.py ~/obsidian/00_Inbox/_dispatch_logs/plan_YYYY-MM-DD_HHMM.json --format json
 ```
 
-报告：
+机械错误包括：
 
-- 当前 `pending_root`
-- 扫描了多少篇
-- 建议移动多少篇
-- 每个队列多少篇
-- `fallback_queue` 多少篇
-- `trash_queue` 多少篇
-- 典型边界案例和低置信项
+- source 缺失或不存在
+- destination 不在当前动态队列中
+- `category_name` 与 `destination` 不一致
+- 目标文件已存在
+- plan 结构错误
 
-### Step 6：Robert 确认后才执行
+这些错误必须修正；无法自动修正时，计入错误数并暂停询问 Robert。
+
+#### 5.2 大模型语义验收
+
+大模型必须对 plan 做第二遍“反向审稿”，而不是直接相信第一遍分类：
+
+1. 重新读取当前队列清单。
+2. 对每条 dispatch 重新看 `title`、`headings`、`body_preview`、`tags`、`source_dir`。
+3. 对以下条目读取完整笔记再判断：
+   - `confidence=medium/low`
+   - 目标目录是新增目录或无明确 metadata
+   - 标题同时命中多个队列
+   - 进入 `trash_queue` 的内容
+   - 高考、个人记录、待判定等容易误分的内容
+4. 检查 `category_name`、`destination`、`confidence`、`reason` 是否一致。
+5. 修正错误分类、错误置信度、错误理由、错误目标目录。
+
+**错误计数规则**：
+
+- 一条笔记目标队列错误 = 1 个错误
+- 一条笔记应进入 `fallback_queue` / `trash_queue` 但没有进入 = 1 个错误
+- 一条笔记被误判为 `trash_queue` = 1 个错误
+- 一条笔记的 destination/category 不一致 = 1 个错误
+- source 缺失、目标冲突等机械错误 = 1 个错误
+- 只改措辞、不影响分类和执行的 reason 优化不计错误
+
+验收后在 plan 中追加或更新 `plan_review`：
+
+```json
+{
+  "plan_review": {
+    "reviewer": "LLM",
+    "reviewed_at": "2026-05-06T22:10:00+08:00",
+    "semantic_errors": 2,
+    "mechanical_errors": 0,
+    "total_errors": 2,
+    "corrections": [
+      {
+        "source": "00_Inbox/Get笔记/example.md",
+        "before": "AI工作台",
+        "after": "Agent Harness",
+        "reason": "正文重点是 Agent 运行时和 skill 编排，不是工作台产品。"
+      }
+    ],
+    "decision": "auto_execute"
+  }
+}
+```
+
+如有修正，推荐另存为：
+
+```text
+00_Inbox/_dispatch_logs/plan_YYYY-MM-DD_HHMM_reviewed.json
+```
+
+### Step 6：按错误阈值决定是否执行
+
+验收完成后：
+
+- `total_errors > 5`：**不要执行移动**。向 Robert 报告错误数量、典型错误和修正建议，请 Robert 确认后再继续。
+- `total_errors <= 5`：修正 plan 后，先运行 dry-run 做最后机械校验；如果 dry-run 无异常，**直接执行移动**，无需再次请求 Robert 确认。
+- 若用户明确说“只生成 plan / 先别动”，无论错误数多少都不要执行。
+
+最后机械校验：
 
 ```bash
-python3 scripts/mover.py ~/obsidian/00_Inbox/_dispatch_logs/plan_YYYY-MM-DD_HHMM.json --execute
+python3 scripts/mover.py ~/obsidian/00_Inbox/_dispatch_logs/plan_YYYY-MM-DD_HHMM_reviewed.json --dry-run
+```
+
+如果 dry-run 发现源文件消失、目标已存在、目标不明等问题：先修正 plan；无法修正则询问 Robert。
+
+### Step 7：执行移动
+
+当 `total_errors <= 5` 且 dry-run 正常时，直接执行：
+
+```bash
+python3 scripts/mover.py ~/obsidian/00_Inbox/_dispatch_logs/plan_YYYY-MM-DD_HHMM_reviewed.json --execute
 ```
 
 执行后报告：
 
+- 当前 `pending_root`
+- 大模型验收错误数与是否修正
 - 已移动多少条
 - 跳过多少条（目标已存在 / 源文件消失 / plan 无效）
 - 图片迁移/缺失统计
 - 是否需要对某个队列做去重、价值判断或编入 `60_wiki/<主题>/`
 
----
-
 ## 常见用户意图映射
 
 | 用户说法 | 动作 |
 |---|---|
-| “分拣 inbox” | 读取当前队列，扫描最近 30 天 50 篇，生成 plan，dry-run 报告 |
-| “整理 inbox 最近一周” | `scanner.py --since-days 7 --limit 50` |
-| “全量看看” | `scanner.py --all --limit 50`，仍分批 |
-| “从最旧的开始” | `scanner.py --all --oldest-first --limit 50` |
-| “执行这个 plan” | 先确认用户已经审核；然后 `mover.py plan --execute` |
+| “分拣 inbox” | 读取当前队列，扫描最近 30 天 50 篇，生成 plan，经大模型验收；错误≤5 则修正后自动执行，错误>5 则请求确认 |
+| “整理 inbox 最近一周” | `scanner.py --since-days 7 --limit 50`，之后同样执行 plan 验收阈值流程 |
+| “全量看看” | `scanner.py --all --limit 50`，仍分批；若用户只想看则不自动执行 |
+| “从最旧的开始” | `scanner.py --all --oldest-first --limit 50`，之后同样执行 plan 验收阈值流程 |
+| “执行这个 plan” | 先运行 `validate_plan.py` 和大模型验收；错误≤5 可执行，错误>5 请求确认 |
 
 ---
 
