@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """
-Get笔记增量同步脚本 v4（支持图片附件）
-- 增量策略：记录「上次同步到的最新笔记时间」，下次只同步该时间之后的笔记
-- API 总是从 since_id=0 全量拉取（在本地过滤时间戳）
-- img_text 类型笔记：下载图片附件到本地，嵌入 markdown
-- ⚠️ 不再支持 --full（已移除，2026-05-07 事故教训）
-- 支持 --dry-run 预览
+Get笔记增量同步脚本 v5（真正增量 + 去重 + 安全 dry-run）
+
+默认策略：
+- 启动时扫描 Obsidian vault 中已有的 Get笔记 note_id，避免已同步/已移动/已编入 wiki 的笔记再次落入 Inbox。
+- 增量同步只从 note/list 的最新页（since_id=0）开始向旧页翻，遇到上次同步水位后停止；不再每次拉完整列表。
+- 状态文件落后于 vault 时，自动用 vault 中已有笔记的最大 date 修复 last_synced_at。
+- --full 仅在显式指定时全量扫描列表，但仍按 note_id 跳过已有笔记，不覆盖本地文件。
+- --dry-run 不写文件、不下载图片、不更新状态。
 """
 
-import json, urllib.request, urllib.error, re, os, sys, time, hashlib
 import concurrent.futures
+import glob
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone, timedelta
+
 
 def load_getnote_local_credentials():
     """Load credentials from the Get笔记 skill local env file when shell env is unset."""
@@ -29,7 +39,7 @@ def load_getnote_local_credentials():
                     continue
                 key, value = line.split("=", 1)
                 key = key.strip()
-                value = value.strip().strip("\"").strip("'")
+                value = value.strip().strip('"').strip("'")
                 if key.startswith("GETNOTE_") and key not in os.environ:
                     os.environ[key] = value
         break
@@ -40,38 +50,52 @@ load_getnote_local_credentials()
 API_KEY = os.environ.get("GETNOTE_API_KEY", "")
 CLIENT_ID = os.environ.get("GETNOTE_CLIENT_ID", "cli_a1b2c3d4e5f6789012345678abcdef90")
 BASE_URL = "https://openapi.biji.com"
-OUT_DIR = os.path.expanduser("~/obsidian/00_Inbox/Get笔记")
-AUDIO_OUT_DIR = os.path.expanduser("~/obsidian/00_Inbox/音频")
+
+VAULT_DIR = os.path.expanduser("~/obsidian")
+OUT_DIR = os.path.join(VAULT_DIR, "00_Inbox", "Get笔记")
+AUDIO_OUT_DIR = os.path.join(VAULT_DIR, "00_Inbox", "音频")
 ASSETS_DIR = os.path.join(OUT_DIR, "_assets", "Get笔记")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".getnote_sync_state.json")
 PROGRESS_FILE = "/tmp/openclaw/getnote-sync-progress.json"
-# llm-wiki 编译后的源文件存放目录（已消费的笔记不重新下载）
-WIKI_RAW_DIR = os.path.expanduser("~/obsidian/40_知识/wiki/raw/articles")
+
+# 录音/音频类笔记统一进入 00_Inbox/音频/
+AUDIO_NOTE_TYPES = {
+    "audio",
+    "meeting",
+    "local_audio",
+    "internal_record",
+    "class_audio",
+    "recorder_audio",
+    "recorder_flash_audio",
+}
+
+# 标准 vault 顶级目录；扫描这些目录里的 frontmatter note_id，避免已移动笔记被重复导入。
+VAULT_SCAN_TOP_DIRS = [
+    "00_Inbox",
+    "10_思考",
+    "20_研究",
+    "30_项目",
+    "50_个人",
+    "60_wiki",
+    "70_写作",
+    "80_高考",
+    "99_归档",
+]
+
+# 明确识别 wiki raw/articles，兼容旧路径，避免旧脚本路径写错后反复重拉已消费内容。
+LEGACY_WIKI_RAW_DIRS = [
+    os.path.join(VAULT_DIR, "60_wiki", "wiki", "raw", "articles"),
+    os.path.join(VAULT_DIR, "40_知识", "wiki", "raw", "articles"),
+]
 
 CST = timezone(timedelta(hours=8))
 
 DRY_RUN = "--dry-run" in sys.argv
-FULL_SYNC = False  # 强制禁用全量，2026-05-07 事故教训
-MAX_WORKERS = 4  # 并发下载图片
+FULL_SYNC = "--full" in sys.argv
+MAX_WORKERS = 4
 
 # 图片 URL 缓存（避免同一笔记重复下载）
 _url_cache = {}
-
-# 已消费笔记 ID 缓存（避免扫描目录多次）
-_consumed_ids = None
-
-
-def is_note_consumed(note_id_short):
-    """检查笔记是否已被 llm-wiki 消费（移入 wiki/raw/articles/）"""
-    global _consumed_ids
-    if _consumed_ids is None:
-        _consumed_ids = set()
-        if os.path.isdir(WIKI_RAW_DIR):
-            for f in os.listdir(WIKI_RAW_DIR):
-                if f.endswith(".md"):
-                    _consumed_ids.add(f)
-    # 文件名格式：2026-04-27 Title (note_id[:8]).md → 检查 note_id 片段
-    return any(note_id_short in f for f in _consumed_ids)
 
 
 def log(msg):
@@ -79,23 +103,30 @@ def log(msg):
     sys.stdout.flush()
 
 
+def now_iso():
+    return datetime.now(CST).isoformat()
+
+
 def write_progress(status, synced=0, total=0, error=""):
     os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
-    with open(PROGRESS_FILE, "w") as f:
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         json.dump({
             "status": status,
             "synced": synced,
             "total": total,
             "error": error,
-            "updated_at": datetime.now(CST).isoformat(),
-        }, f)
+            "updated_at": now_iso(),
+        }, f, ensure_ascii=False)
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return {}
+    return {}
 
 
 def save_state(state):
@@ -113,38 +144,19 @@ def api_get(path, params="", timeout=30):
     })
     resp = urllib.request.urlopen(req, timeout=timeout)
     text = resp.read().decode()
+    # Get笔记 ID 是 int64，统一在 JSON decode 前字符串化，避免精度问题。
     safe = re.sub(
         r'"(id|note_id|next_cursor|parent_id|follow_id|live_id)"\s*:\s*(\d+)',
         r'"\1":"\2"',
-        text
+        text,
     )
     return json.loads(safe)
 
 
-def fetch_all_notes():
-    all_notes = []
-    cursor = "0"
-    while True:
-        log(f"  [批次] 拉取中... cursor={cursor[:16]}...")
-        try:
-            data = api_get("/open/api/v1/resource/note/list", f"since_id={cursor}")
-        except Exception as e:
-            log(f"  ⚠️  拉取失败: {e}，2秒后重试...")
-            time.sleep(2)
-            continue
-        d = data.get("data") or {}
-        batch = d.get("notes", [])
-        if not batch:
-            break
-        all_notes.extend(batch)
-        log(f"  [批次] +{len(batch)} 条，累计 {len(all_notes)} 条...")
-        if not d.get("has_more"):
-            break
-        cursor = d.get("next_cursor", "")
-        if not cursor:
-            break
-    all_notes.sort(key=lambda n: n.get("created_at", ""))
-    return all_notes
+def fetch_note_list_page(cursor):
+    data = api_get("/open/api/v1/resource/note/list", f"since_id={cursor}")
+    d = data.get("data") or {}
+    return d.get("notes", []) or [], d
 
 
 def fetch_detail_with_retry(note_id, retries=3, delay=5):
@@ -153,42 +165,226 @@ def fetch_detail_with_retry(note_id, retries=3, delay=5):
             data = api_get("/open/api/v1/resource/note/detail", f"id={note_id}", timeout=15)
             return (data.get("data") or {}).get("note", {})
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < retries - 1:
+            if e.code in (429, 10202) and attempt < retries - 1:
                 wait = delay * (attempt + 1)
-                log(f"    429 限流，等待 {wait}s（{attempt+1}/{retries}）...")
+                log(f"    429/限流，等待 {wait}s（{attempt+1}/{retries}）...")
                 time.sleep(wait)
             else:
                 raise
         except Exception as e:
             if attempt < retries - 1:
-                log(f"    详情失败 {note_id[:16]}...: {e}，重试中...")
+                log(f"    详情失败 {str(note_id)[:16]}...: {e}，重试中...")
                 time.sleep(2)
             else:
                 raise
 
 
+def parse_ts(ts_str):
+    if not ts_str:
+        return None
+    s = str(ts_str).strip()
+    # 兼容 2026-05-11 22:39:59、2026-05-11T22:39:59+08:00 等格式。
+    variants = [s, s.replace("Z", "+00:00")]
+    if "T" in s and len(s) >= 19:
+        variants.append(s[:19])
+    if " " in s and len(s) >= 19:
+        variants.append(s[:19])
+    for item in variants:
+        try:
+            return datetime.fromisoformat(item).timestamp()
+        except Exception:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s[:19] if "%z" not in fmt else s, fmt).timestamp()
+        except Exception:
+            pass
+    return None
+
+
+def ts_after(a, b):
+    if not b:
+        return bool(a)
+    av = parse_ts(a)
+    bv = parse_ts(b)
+    if av is None or bv is None:
+        return str(a or "") > str(b or "")
+    return av > bv
+
+
+def ts_equal(a, b):
+    if not a or not b:
+        return False
+    av = parse_ts(a)
+    bv = parse_ts(b)
+    if av is None or bv is None:
+        return str(a or "")[:19] == str(b or "")[:19]
+    return abs(av - bv) < 0.001
+
+
+def max_ts(a, b):
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if ts_after(a, b) else b
+
+
+def yaml_scalar(value):
+    value = str(value).strip()
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    return value
+
+
+def read_frontmatter(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            head = f.read(8192)
+    except Exception:
+        return {}
+    if not head.startswith("---"):
+        return {}
+    end = head.find("\n---", 3)
+    if end == -1:
+        return {}
+    block = head[3:end]
+    fm = {}
+    for line in block.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fm[key.strip()] = yaml_scalar(value)
+    return fm
+
+
+def is_under(path, root):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+    except Exception:
+        return False
+
+
+def wiki_raw_dirs():
+    dirs = set(LEGACY_WIKI_RAW_DIRS)
+    for pattern in (
+        os.path.join(VAULT_DIR, "60_wiki", "*", "raw", "articles"),
+        os.path.join(VAULT_DIR, "60_wiki", "*", "raw"),
+    ):
+        dirs.update(glob.glob(pattern))
+    return [d for d in sorted(dirs) if os.path.isdir(d)]
+
+
+def is_consumed_path(path):
+    normalized = os.path.abspath(path)
+    for d in wiki_raw_dirs():
+        if is_under(normalized, d):
+            return True
+    return False
+
+
+def iter_vault_markdown_files():
+    skip_dir_names = {".obsidian", ".claude", ".claudian", ".git", "node_modules", "__pycache__", "_assets"}
+    for top in VAULT_SCAN_TOP_DIRS:
+        root = os.path.join(VAULT_DIR, top)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip_dir_names and not d.startswith(".")]
+            for name in filenames:
+                if name.endswith(".md"):
+                    yield os.path.join(dirpath, name)
+
+
+def build_note_index():
+    """扫描 vault 中已有 Get笔记 note_id，返回 note_id -> record。"""
+    index = {}
+    for path in iter_vault_markdown_files():
+        fm = read_frontmatter(path)
+        note_id = str(fm.get("note_id", "")).strip()
+        if not note_id:
+            continue
+        # 优先识别 Get笔记；如果 source 缺失但位于 Get笔记/音频/wiki raw，也纳入防重。
+        source = str(fm.get("source", "")).strip()
+        looks_getnote = (
+            source == "Get笔记"
+            or is_under(path, OUT_DIR)
+            or is_under(path, AUDIO_OUT_DIR)
+            or is_consumed_path(path)
+        )
+        if not looks_getnote:
+            continue
+        rec = index.setdefault(note_id, {
+            "paths": [],
+            "active_paths": [],
+            "consumed_paths": [],
+            "created_at": "",
+        })
+        rec["paths"].append(path)
+        if is_consumed_path(path):
+            rec["consumed_paths"].append(path)
+        else:
+            rec["active_paths"].append(path)
+        created = str(fm.get("date", "")).strip()
+        if created:
+            rec["created_at"] = max_ts(rec.get("created_at"), created)
+    return index
+
+
+def note_exists(note_id, note_index):
+    return bool(note_id and str(note_id) in note_index and note_index[str(note_id)].get("paths"))
+
+
+def note_is_consumed(note_id, note_index):
+    return bool(note_id and str(note_id) in note_index and note_index[str(note_id)].get("consumed_paths"))
+
+
+def local_max_created_at(note_index):
+    latest = ""
+    for rec in note_index.values():
+        latest = max_ts(latest, rec.get("created_at", ""))
+    return latest or None
+
+
+def reconcile_state_with_vault(state, note_index):
+    """如果状态水位落后于 vault 中已有笔记，自动抬高水位，避免重复同步。"""
+    state = dict(state or {})
+    local_latest = local_max_created_at(note_index)
+    current = state.get("last_synced_at")
+    changed = False
+    if local_latest and (not current or ts_after(local_latest, current)):
+        state["last_synced_at"] = local_latest
+        state["reconciled_from_vault_at"] = now_iso()
+        state["reconciled_from_vault_note_count"] = len(note_index)
+        changed = True
+    return state, changed, local_latest
+
+
 def download_image(url, note_id, idx, retries=3):
-    """下载图片，返回本地保存路径（相对路径）"""
+    """下载图片，返回本地保存路径（相对 OUT_DIR 的路径）。"""
     global _url_cache
-    cache_key = f"{note_id}:{idx}"
+    cache_key = f"{note_id}:{idx}:{url}"
     if cache_key in _url_cache:
         return _url_cache[cache_key]
 
     os.makedirs(ASSETS_DIR, exist_ok=True)
 
-    # 从 URL 提取扩展名
-    if ".jpeg" in url or ".jpg" in url:
+    lower = url.lower()
+    if ".jpeg" in lower or ".jpg" in lower:
         ext = ".jpg"
-    elif ".png" in url:
+    elif ".png" in lower:
         ext = ".png"
-    elif ".gif" in url:
+    elif ".gif" in lower:
         ext = ".gif"
-    elif ".webp" in url:
+    elif ".webp" in lower:
         ext = ".webp"
     else:
         ext = ".jpg"
 
-    local_filename = f"{note_id[:12]}_{idx}{ext}"
+    safe_id = str(note_id) or "unknown"
+    local_filename = f"{safe_id}_{idx}{ext}"
     local_path = os.path.join(ASSETS_DIR, local_filename)
     rel_path = os.path.join("_assets", "Get笔记", local_filename)
 
@@ -218,9 +414,9 @@ def download_image(url, note_id, idx, retries=3):
     return None
 
 
-def safe_filename(title, max_len=40):
+def safe_filename(title, max_len=48):
     # Obsidian 禁用字符: \ / : * ? " < > | # ^ [ ]
-    return (title[:max_len]
+    return (str(title or "无标题")[:max_len]
         .replace("\\", "＼")
         .replace("/", "／")
         .replace(":", "：")
@@ -233,61 +429,59 @@ def safe_filename(title, max_len=40):
         .replace("#", "＃")
         .replace("^", "＾")
         .replace("[", "［")
-        .replace("]", "］"))
+        .replace("]", "］")
+        .strip()) or "无标题"
 
 
-def parse_ts(ts_str):
-    if not ts_str:
-        return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(ts_str[:26], fmt).timestamp()
-        except Exception:
-            pass
-    try:
-        clean = ts_str[:19]
-        return datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S").timestamp()
-    except Exception:
-        return None
+def filename_for_note(note):
+    note_id = str(note.get("note_id", note.get("id", ""))).strip()
+    created = str(note.get("created_at", ""))[:10] or datetime.now(CST).strftime("%Y-%m-%d")
+    title = safe_filename(note.get("title", "无标题"))
+    # v5 起使用完整 note_id，避免旧版前 8 位在同一天多条笔记中大量碰撞。
+    suffix = note_id if note_id else hashlib_fallback(f"{created}-{title}")
+    return f"{created} {title} ({suffix}).md"
+
+
+def hashlib_fallback(text):
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def extract_image_urls(text):
-    """从 markdown 文本中提取所有图片 URL"""
+    """从 markdown/html 文本中提取所有图片 URL。"""
     if not text:
         return []
-    import re
-    # 匹配 ![...](url) 和 <img src="url">
     urls = re.findall(r'!\[.*?\]\((.*?)\)', text)
     urls.extend(re.findall(r'<img[^>]+src=["\'](.*?)["\']', text))
-    return urls
+    # 保持顺序去重
+    seen = set()
+    result = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result
 
 
 def replace_images_in_text(text, url_to_local_path):
-    """将文本中的图片 URL 替换为本地路径"""
-    import re
-    # 替换 ![...](url) — 2个捕获组: (prefix+url) 和 (url)
+    """将文本中的图片 URL 替换为本地路径。"""
     def replacer_md(m):
-        full = m.group(0)        # 完整匹配 ![...](url)
-        url = m.group(1)        # URL
+        url = m.group(1)
         local = url_to_local_path.get(url, url)
-        # 重新构建: ![](local)
         return f'![]({local})'
     text = re.sub(r'!\[.*?\]\((.*?)\)', replacer_md, text)
 
-    # 替换 <img src="url"> — 1个捕获组: (url)
     def replacer_img(m):
-        prefix = m.group(0)[:m.start(1)-m.start(0)]  # <img ... src="
+        full = m.group(0)
         url = m.group(1)
-        suffix = m.group(0)[m.end(1)-m.start(0):]    # "
         local = url_to_local_path.get(url, url)
-        return f'{prefix}{local}{suffix}'
+        return full.replace(url, local, 1)
     text = re.sub(r'<img[^>]+src=["\'](.*?)["\']', replacer_img, text)
     return text
 
 
 def download_and_replace_images(text, note_id):
-    """下载文本中的所有图片，返回替换后的文本和图片路径列表"""
+    """下载文本中的所有图片，返回替换后的文本和图片路径列表。"""
     urls = extract_image_urls(text)
     if not urls:
         return text, []
@@ -311,12 +505,11 @@ def note_to_md(note, image_paths=None):
     created = note.get("created_at", "")
     tags = note.get("tags", [])
     content = note.get("content", "")
-    note_id = note.get("note_id", note.get("id", ""))
-    web_page = note.get("web_page", {})
+    note_id = str(note.get("note_id", note.get("id", ""))).strip()
+    web_page = note.get("web_page", {}) or {}
     web_url = web_page.get("url", "")
     ref_content = note.get("ref_content", "") or ""
 
-    # 处理 tags：可能是字符串列表，也可能是 dict 列表（Get笔记 API 返回的是 dict 列表）
     if tags:
         processed = []
         for t in tags:
@@ -328,22 +521,29 @@ def note_to_md(note, image_paths=None):
     else:
         tag_str = ""
 
-    lines = [f"---", f'title: "{title}"', f"date: {created}",
-             f"source: Get笔记", f"source_type: {note_type}", f'note_id: "{note_id}"']
+    # 注意：沿用旧 frontmatter 结构，避免破坏现有查询。
+    safe_title = str(title).replace('"', '\\"')
+    lines = [
+        "---",
+        f'title: "{safe_title}"',
+        f"date: {created}",
+        "source: Get笔记",
+        f"source_type: {note_type}",
+        f'note_id: "{note_id}"',
+    ]
     if tag_str:
         lines.append(f"tags: {tag_str}")
     if web_url:
         lines.append(f"url: {web_url}")
-    lines.append(f"---")
+    lines.append("---")
     lines.append(f"# {title}")
     lines.append("")
 
-    # 链接笔记：优先使用 web_page.content（原文），而非 AI 总结（content）
-    # AI 总结放在正文前
+    # 链接笔记：优先使用 web_page.content（原文），AI 总结放在正文前。
     if note_type == "link" and web_page.get("content"):
         body_content = web_page["content"]
-        if content and content.strip():
-            ai_summary_block = f"{content.strip()}\n\n---\n\n"
+        if content and str(content).strip():
+            ai_summary_block = f"{str(content).strip()}\n\n---\n\n"
         else:
             ai_summary_block = ""
     elif ref_content:
@@ -354,13 +554,12 @@ def note_to_md(note, image_paths=None):
         ai_summary_block = ""
 
     if body_content:
-        lines.append(ai_summary_block + body_content)
+        lines.append(ai_summary_block + str(body_content))
 
-    # 嵌入图片（link 类型已在 body_content 中通过 download_and_replace_images 处理过，无需重复追加）
     if image_paths and note_type != "link":
         for p in image_paths:
             if p:
-                lines.append(f"")
+                lines.append("")
                 lines.append(f"![]({p})")
 
     if web_url and note_type == "link":
@@ -369,231 +568,336 @@ def note_to_md(note, image_paths=None):
     return "\n".join(lines)
 
 
-def write_note(note, out_dir):
-    note_id = note.get("note_id", note.get("id", ""))
-    created = note.get("created_at", "")[:10]
+def out_dir_for_note(note):
+    return AUDIO_OUT_DIR if note.get("note_type") in AUDIO_NOTE_TYPES else OUT_DIR
 
-    # 检查笔记是否已被 llm-wiki 消费（移入 wiki/raw/articles/）
-    if note_id and is_note_consumed(note_id[:8]):
-        return None, f"⏭️  跳过（已编入 wiki/raw/articles/）：{note.get('title', '')[:30]}"
 
-    # 音频笔记转写未完成检查
-    if note.get("note_type") == "recorder_audio":
+def write_note(note, out_dir, note_index):
+    """写入单条笔记。
+
+    返回 (status, message)：
+    - written / dry_run
+    - existing / consumed / pending
+    - error
+    """
+    note_id = str(note.get("note_id", note.get("id", ""))).strip()
+    title = note.get("title", "无标题")
+
+    if note_id and note_is_consumed(note_id, note_index):
+        path = note_index[note_id]["consumed_paths"][0]
+        return "consumed", f"⏭️  跳过（已编入 wiki/raw/articles）：{os.path.relpath(path, VAULT_DIR)}"
+
+    if note_id and note_exists(note_id, note_index):
+        path = note_index[note_id]["paths"][0]
+        return "existing", f"⏭️  跳过（vault 已存在同 note_id）：{os.path.relpath(path, VAULT_DIR)}"
+
+    # 音频笔记转写未完成检查。
+    if note.get("note_type") in AUDIO_NOTE_TYPES:
         content = note.get("content", "") or ""
-        if len(content.strip()) < 50:
-            title = note.get("title", "无标题")
-            return None, f"⏳ 跳过（转写生成中）：{title}"
+        if len(str(content).strip()) < 50:
+            return "pending", f"⏳ 跳过（转写生成中）：{title}"
 
-    # 处理图片附件（img_text 类型）
+    filename = filename_for_note(note)
+    filepath = os.path.join(out_dir, filename)
+
+    if DRY_RUN:
+        return "dry_run", f"[dry-run] 将写入：{os.path.relpath(filepath, VAULT_DIR)}"
+
+    # 二次防重：即使 index 漏扫，也不要覆盖同名文件。
+    if os.path.exists(filepath):
+        return "existing", f"⏭️  跳过（目标文件已存在）：{os.path.relpath(filepath, VAULT_DIR)}"
+
     image_paths = []
-    if note.get("note_type") == "img_text" and note.get("attachments"):
-        attachments = note.get("attachments", [])
-        for idx, att in enumerate(attachments):
-            if att.get("type") == "image" and att.get("url"):
-                p = download_image(att["url"], note_id, idx)
-                if p:
-                    image_paths.append(p)
-
-    # 链接笔记：下载 web_page.content 中的图片并替换 URL
-    if note.get("note_type") == "link":
-        web_page = note.get("web_page", {})
-        if web_page.get("content"):
-            content_with_local_images, downloaded_paths = download_and_replace_images(
-                web_page["content"], note_id
-            )
-            if downloaded_paths:
-                image_paths.extend(downloaded_paths)
-                # 将替换后的内容写回 note，避免 note_to_md 再次从 web_page.content 拿 URL
-                note = dict(note)
-                note["web_page"] = dict(web_page)
-                note["web_page"]["content"] = content_with_local_images
-
     try:
+        # 处理图片附件（img_text 类型）。
+        if note.get("note_type") == "img_text" and note.get("attachments"):
+            attachments = note.get("attachments", []) or []
+            for idx, att in enumerate(attachments):
+                if att.get("type") == "image" and (att.get("original_url") or att.get("url")):
+                    p = download_image(att.get("original_url") or att.get("url"), note_id, idx)
+                    if p:
+                        image_paths.append(p)
+
+        # 链接笔记：下载 web_page.content 中的图片并替换 URL。
+        if note.get("note_type") == "link":
+            web_page = note.get("web_page", {}) or {}
+            if web_page.get("content"):
+                content_with_local_images, downloaded_paths = download_and_replace_images(
+                    web_page["content"], note_id
+                )
+                if downloaded_paths:
+                    image_paths.extend(downloaded_paths)
+                    note = dict(note)
+                    note["web_page"] = dict(web_page)
+                    note["web_page"]["content"] = content_with_local_images
+
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(ASSETS_DIR, exist_ok=True)
         md = note_to_md(note, image_paths)
-        title = safe_filename(note.get("title", "无标题"))
-        filename = f"{created} {title} ({note_id[:8]}).md"
-        filepath = os.path.join(out_dir, filename)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(md)
         ts = parse_ts(note.get("created_at", ""))
         if ts:
             os.utime(filepath, (ts, ts))
-        return True, filename
+        # 更新本轮内存索引，防止同一轮重复写入同 note_id。
+        if note_id:
+            note_index[note_id] = {
+                "paths": [filepath],
+                "active_paths": [filepath],
+                "consumed_paths": [],
+                "created_at": note.get("created_at", ""),
+            }
+        return "written", filename
     except Exception as e:
-        return False, str(e)
+        return "error", str(e)
+
+
+def add_unique_note(result, seen_ids, note, reason):
+    note_id = str(note.get("note_id", note.get("id", ""))).strip()
+    if not note_id or note_id in seen_ids:
+        return False
+    item = dict(note)
+    item["_sync_reason"] = reason
+    result.append(item)
+    seen_ids.add(note_id)
+    return True
+
+
+def fetch_notes_for_sync(cutoff, note_index, retry_ids=None, full=False):
+    """获取需要同步的列表项。
+
+    默认从 since_id=0 开始翻页，遇到 cutoff（水位）所在页后停止。
+    retry_ids 会直接按详情接口重试，不强迫列表全量扫描。
+    """
+    retry_ids = {str(x) for x in (retry_ids or []) if x}
+    result = []
+    seen_ids = set()
+    stats = {
+        "pages_fetched": 0,
+        "list_notes_seen": 0,
+        "api_total": None,
+        "stopped_at_cutoff": False,
+        "retried_ids": 0,
+    }
+
+    # 旧的 skipped_notes 直接走详情接口；若 vault 已经存在，则清理掉，不再重试。
+    for note_id in sorted(retry_ids):
+        if note_exists(note_id, note_index):
+            continue
+        add_unique_note(result, seen_ids, {"note_id": note_id, "id": note_id, "_retry_only": True}, "retry")
+        stats["retried_ids"] += 1
+
+    cursor = "0"
+    while True:
+        log(f"  [列表] 拉取 cursor={str(cursor)[:16]}...")
+        try:
+            batch, data = fetch_note_list_page(cursor)
+        except Exception as e:
+            log(f"  ⚠️  列表拉取失败: {e}，2秒后重试...")
+            time.sleep(2)
+            batch, data = fetch_note_list_page(cursor)
+
+        stats["pages_fetched"] += 1
+        stats["list_notes_seen"] += len(batch)
+        stats["api_total"] = data.get("total")
+        log(f"  [列表] +{len(batch)} 条（累计检查 {stats['list_notes_seen']} / API total={stats['api_total']}）")
+
+        if not batch:
+            break
+
+        reached_cutoff_on_page = False
+        for note in batch:
+            note_id = str(note.get("note_id", note.get("id", ""))).strip()
+            created = note.get("created_at", "")
+
+            if cutoff and not ts_after(created, cutoff):
+                reached_cutoff_on_page = True
+
+            if note_id and note_exists(note_id, note_index):
+                continue
+
+            # 对 cutoff 同秒但本地缺失的 note_id 也纳入处理，避免同一秒多条笔记被水位遗漏。
+            if full or not cutoff or ts_after(created, cutoff) or ts_equal(created, cutoff):
+                add_unique_note(result, seen_ids, note, "new" if not full else "full-missing")
+                continue
+
+            # 音频类笔记可能列表出现较早但转写稍后完成；只要它出现在本次增量检查窗口且本地没有，就重试详情。
+            if note.get("note_type") in AUDIO_NOTE_TYPES:
+                add_unique_note(result, seen_ids, note, "audio-delayed")
+
+        if not data.get("has_more"):
+            break
+        if not full and cutoff and reached_cutoff_on_page:
+            stats["stopped_at_cutoff"] = True
+            break
+        cursor = str(data.get("next_cursor") or "")
+        if not cursor:
+            break
+
+    # 保持旧版写入顺序：旧到新。retry-only 没有 created_at，会排在前面。
+    result.sort(key=lambda n: n.get("created_at", ""))
+    return result, stats
+
+
+def state_with_run_metadata(state, note_index, stats, synced_ok, still_skipped, new_max_created, sync_start_time):
+    state = dict(state or {})
+    previous_cutoff = state.get("last_synced_at")
+    state["last_synced_at"] = max_ts(previous_cutoff, new_max_created) if new_max_created else previous_cutoff
+    state["total_synced"] = int(state.get("total_synced", 0) or 0) + synced_ok
+    state["skipped_notes"] = sorted(still_skipped)
+    consumed = sorted([nid for nid, rec in note_index.items() if rec.get("consumed_paths")])
+    state["consumed_notes"] = consumed
+    state["consumed_total"] = len(consumed)
+    state["known_note_ids_in_vault"] = len(note_index)
+    state["last_run_at"] = sync_start_time
+    state["last_run"] = stats
+    return state
 
 
 def main():
-    global _url_cache, _consumed_ids
-    _consumed_ids = None  # 重置已消费笔记缓存
+    global _url_cache
+    _url_cache = {}
+
+    if not API_KEY:
+        raise RuntimeError("未配置 GETNOTE_API_KEY，请先配置 Get笔记 API Key。")
+
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(AUDIO_OUT_DIR, exist_ok=True)
-    os.makedirs(ASSETS_DIR, exist_ok=True)
+    if not DRY_RUN:
+        os.makedirs(ASSETS_DIR, exist_ok=True)
     write_progress("running", synced=0, total=0)
 
-    state = load_state()
-    skipped_ids = set()
-    if state and state.get("skipped_notes"):
-        skipped_ids = set(state["skipped_notes"])
-
-    # 记录本次同步开始时间，用于 cutoff（只在有笔记同步成功时才用）
-    sync_start_time = datetime.now(CST).isoformat()
+    sync_start_time = now_iso()
+    original_state = load_state()
+    note_index = build_note_index()
+    state, reconciled, local_latest = reconcile_state_with_vault(original_state, note_index)
+    skipped_ids = set(str(x) for x in (state.get("skipped_notes") or []) if x)
+    cutoff = None if FULL_SYNC else state.get("last_synced_at")
 
     if FULL_SYNC:
-        cutoff = None
-        log("🔄 全量同步模式（--full 已禁用，此分支不会触发）")
-    elif state and state.get("last_synced_at"):
-        cutoff = state["last_synced_at"]
-        total_prev = state.get("total_synced", 0)
-        log(f"📡 增量同步模式，cutoff={cutoff}（上次共同步 {total_prev} 条）")
+        log("📡 显式全量扫描模式：会检查所有列表页，但仍按 note_id 跳过 vault 已存在笔记")
+    elif cutoff:
+        log(f"📡 增量同步模式，cutoff={cutoff}")
+        if reconciled:
+            log(f"🧭 状态水位已按 vault 自动修复：local_latest={local_latest}（已有 {len(note_index)} 个 Get笔记 note_id）")
         if skipped_ids:
             log(f"🔄 待重试的跳过笔记：{len(skipped_ids)} 条")
     else:
-        cutoff = None
-        log("📡 首次同步，自动全量同步")
+        log("📡 首次同步：未找到状态水位，将执行一次全量扫描")
 
-    log("\n开始拉取所有笔记（since_id=0，全量）...")
+    log("\n开始增量拉取笔记列表...")
     write_progress("fetching_list", synced=0, total=0)
-    all_notes = fetch_all_notes()
-    log(f"📋 API 返回共 {len(all_notes)} 条笔记")
+    notes_to_sync, stats = fetch_notes_for_sync(cutoff, note_index, retry_ids=skipped_ids, full=FULL_SYNC or not cutoff)
+    log(
+        f"🔍 列表检查完成：拉取 {stats['pages_fetched']} 页 / 检查 {stats['list_notes_seen']} 条"
+        + ("，已在 cutoff 页停止" if stats.get("stopped_at_cutoff") else "")
+        + f"；需要处理 {len(notes_to_sync)} 条"
+    )
 
-    if cutoff:
-        # 过滤出 cutoff 之后新建的笔记
-        filtered = [n for n in all_notes if n.get("created_at", "") > cutoff[:19]]
-        # 同时无条件加入之前跳过的笔记（转写可能已完成，需要重试）
-        # 注意：这些笔记的 created_at 可能早于 cutoff，必须强制加入，否则永远漏掉
-        if skipped_ids:
-            retry_notes = [n for n in all_notes if n.get("note_id", n.get("id", "")) in skipped_ids]
-            existing_ids = {n.get("note_id", n.get("id", "")) for n in filtered}
-            for n in retry_notes:
-                nid = n.get("note_id", n.get("id", ""))
-                if nid not in existing_ids:
-                    filtered.append(n)
-                    existing_ids.add(nid)
-
-        # 音频笔记特殊处理：即使不在 skipped_ids 里，也检查转写状态
-        # 原因：语音录音可能从设备延迟同步，上次同步时 API 还没有这条笔记
-        # 策略：如果本地没有对应文件，强制拉详情检查转写是否完成
-        audio_notes_in_api = [n for n in all_notes if n.get("note_type") == "recorder_audio"]
-        existing_note_ids = {n.get("note_id", n.get("id", "")) for n in filtered}
-        for n in audio_notes_in_api:
-            nid = n.get("note_id", n.get("id", ""))
-            if nid not in existing_note_ids:
-                # 检查本地是否已有这条笔记
-                created = n.get("created_at", "")[:10]
-                title = n.get("title", "无标题")[:40]
-                filename = f"{created} {title} ({nid[:8]}).md"
-                if not os.path.exists(os.path.join(OUT_DIR, filename)) and not os.path.exists(os.path.join(AUDIO_OUT_DIR, filename)):
-                    filtered.append(n)
-                    existing_note_ids.add(nid)
-        log(f"🔍 本地过滤（>{cutoff[:19]}）：{len(filtered)} 条需要同步" + (f"（含 {len(skipped_ids)} 条重试）" if skipped_ids else ""))
-    else:
-        filtered = all_notes
-        log(f"🔍 全量模式：{len(filtered)} 条全部同步")
-
-    if not filtered:
+    if not notes_to_sync:
         log("没有新笔记需要同步 ✅")
         write_progress("done", synced=0, total=0)
         if not DRY_RUN:
-            # 无新笔记时保留原 cutoff，不更新
-            if state:
-                save_state(state)
+            # 即使没有新笔记，也保存自动修复后的状态水位，避免下次重复检查旧窗口。
+            new_state = state_with_run_metadata(state, note_index, stats, 0, set(), None, sync_start_time)
+            save_state(new_state)
+            if reconciled:
+                log(f"状态已修复并保存：last_synced_at={new_state.get('last_synced_at')}")
         return
 
-    total = len(filtered)
-    synced_ok = 0
-    consumed_this_run = 0  # 本轮因已编入 wiki 而跳过的笔记数
-    # 追踪本次成功同步的笔记中最新那条的 created_at
+    total = len(notes_to_sync)
+    written_ok = 0
+    dry_run_ok = 0
+    skipped_existing = 0
+    skipped_consumed = 0
+    still_skipped = set()
     new_max_created = None
 
     log(f"\n开始获取详情（并发数={MAX_WORKERS}）...")
     write_progress("fetching_details", synced=0, total=total)
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
-    futures = {}
-    for i, note in enumerate(filtered):
-        note_id = note.get("note_id", note.get("id", ""))
-        log(f"  [{i+1}/{total}] 提交: {note_id[:16]}... {note.get('title','')[:25]}")
-        future = executor.submit(fetch_detail_with_retry, note_id)
-        futures[future] = (i, note)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {}
+        for i, note in enumerate(notes_to_sync):
+            note_id = str(note.get("note_id", note.get("id", ""))).strip()
+            reason = note.get("_sync_reason", "")
+            log(f"  [{i+1}/{total}] 提交详情: {note_id[:20]} {reason} {note.get('title','')[:25]}")
+            futures[executor.submit(fetch_detail_with_retry, note_id)] = (i, note)
 
-    completed = 0
-    for future in concurrent.futures.as_completed(futures):
-        i, note = futures[future]
-        completed += 1
-        try:
-            detail = future.result()
-            if detail:
-                note = detail
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            i, list_note = futures[future]
+            completed += 1
+            note_id = str(list_note.get("note_id", list_note.get("id", ""))).strip()
+            try:
+                detail = future.result()
+                note = detail or list_note
+                if not detail:
+                    log(f"  [{completed}/{total}] ⚠️  详情为空: {note_id}")
+            except Exception as e:
+                log(f"  [{completed}/{total}] ⚠️  详情失败: {note_id} {e}")
+                if note_id:
+                    still_skipped.add(note_id)
+                write_progress("writing", synced=written_ok + dry_run_ok, total=total)
+                continue
+
+            status, message = write_note(note, out_dir_for_note(note), note_index)
+            actual_note_id = str(note.get("note_id", note.get("id", note_id))).strip()
+
+            if status == "written":
+                written_ok += 1
+                new_max_created = max_ts(new_max_created, note.get("created_at", ""))
+                log(f"  [{completed}/{total}] ✅ {message}")
+            elif status == "dry_run":
+                dry_run_ok += 1
+                new_max_created = max_ts(new_max_created, note.get("created_at", ""))
+                log(f"  [{completed}/{total}] {message}")
+            elif status == "existing":
+                skipped_existing += 1
+                log(f"  [{completed}/{total}] {message}")
+            elif status == "consumed":
+                skipped_consumed += 1
+                log(f"  [{completed}/{total}] {message}")
+            elif status == "pending":
+                if actual_note_id:
+                    still_skipped.add(actual_note_id)
+                log(f"  [{completed}/{total}] {message}")
             else:
-                log(f"  [{completed}/{total}] ⚠️  详情为空")
-        except Exception as e:
-            log(f"  [{completed}/{total}] ⚠️  详情失败: {e}")
+                if actual_note_id:
+                    still_skipped.add(actual_note_id)
+                log(f"  [{completed}/{total}] ⚠️  写入失败: {message}")
 
-        ok, result = write_note(note, AUDIO_OUT_DIR if note.get("note_type") in ("recorder_audio", "audio") else OUT_DIR)
-        if ok is None:
-            # 区分：已编入 wiki 跳过 vs 转写未完成跳过
-            nid = note.get("note_id", note.get("id", ""))
-            if "已编入 wiki" in result:
-                consumed_this_run += 1
-                log(f"  [{completed}/{total}] {result}")
-            else:
-                skipped_ids.discard(nid)  # 会被 still_skipped 重新收集
-                log(f"  [{completed}/{total}] {result}")
-        elif ok:
-            synced_ok += 1
-            note_created = note.get("created_at", "")
-            if note_created:
-                if new_max_created is None or note_created > new_max_created:
-                    new_max_created = note_created
-        else:
-            log(f"  [{completed}/{total}] ⚠️  写入失败: {result}")
-
-        write_progress("writing", synced=synced_ok, total=total)
-        if completed % 5 == 0 or completed == total:
-            log(f"  进度 {completed}/{total}，成功 {synced_ok} 条...")
-
-    executor.shutdown(wait=True)
-
-    # 收集本轮仍被跳过的笔记 ID
-    still_skipped = []
-    for note in filtered:
-        nid = note.get("note_id", note.get("id", ""))
-        content = note.get("content", "") or ""
-        if note.get("note_type") == "recorder_audio" and len(content.strip()) < 50:
-            still_skipped.append(nid)
+            write_progress("writing", synced=written_ok + dry_run_ok, total=total)
+            if completed % 5 == 0 or completed == total:
+                log(f"  进度 {completed}/{total}，写入 {written_ok} 条" + (f"，dry-run {dry_run_ok} 条" if DRY_RUN else ""))
 
     if not DRY_RUN:
-        # 有新笔记同步成功时：用成功笔记里最新那条的 created_at 作为下次 cutoff
-        # 原因：created_at 是服务器时间，音频笔记的 created_at 可能是录音开始时间（远早于同步时间）
-        # 用它做 cutoff 保证了"这次同步结束时 API 里最新笔记之后"的笔记下次都会被拉进来
-        # 无新笔记时：保留原 cutoff，下次再试（可能还在延迟同步中）
-        if synced_ok > 0 and new_max_created:
-            new_last_synced = new_max_created
-        else:
-            new_last_synced = state.get("last_synced_at") if state else None
-        new_state = {
-            "last_synced_at": new_last_synced,
-            "total_synced": (state.get("total_synced", 0) if state else 0) + synced_ok,
-            "skipped_notes": still_skipped,
-            "consumed_notes": (state.get("consumed_notes", []) if state else []),
-            "consumed_total": (state.get("consumed_total", 0) if state else 0) + consumed_this_run,
-        }
-        # 追加本轮被消费的笔记 ID
-        if consumed_this_run > 0:
-            for note in filtered:
-                nid = note.get("note_id", note.get("id", ""))
-                if nid and is_note_consumed(nid[:8]):
-                    if nid not in new_state["consumed_notes"]:
-                        new_state["consumed_notes"].append(nid)
+        new_state = state_with_run_metadata(
+            state,
+            note_index,
+            stats,
+            written_ok,
+            still_skipped,
+            new_max_created,
+            sync_start_time,
+        )
         save_state(new_state)
-        consumed_total = new_state.get("consumed_total", 0)
-        log(f"\n✅ 同步完成：{synced_ok} 条笔记" + (f"，{consumed_this_run} 条已编入 wiki 跳过" if consumed_this_run > 0 else ""))
-        log(f"状态已更新：last_synced_at={new_last_synced}，累计 {new_state['total_synced']} 条，已消费 {consumed_total} 条")
+        log(
+            f"\n✅ 同步完成：写入 {written_ok} 条"
+            + (f"，已存在跳过 {skipped_existing} 条" if skipped_existing else "")
+            + (f"，已编入 wiki 跳过 {skipped_consumed} 条" if skipped_consumed else "")
+            + (f"，待重试 {len(still_skipped)} 条" if still_skipped else "")
+        )
+        log(f"状态已更新：last_synced_at={new_state.get('last_synced_at')}，累计写入 {new_state.get('total_synced')} 条")
     else:
-        log(f"\n[dry-run] 本次模拟同步 {synced_ok} 条")
+        log(
+            f"\n[dry-run] 预览完成：将写入 {dry_run_ok} 条"
+            + (f"，已存在会跳过 {skipped_existing} 条" if skipped_existing else "")
+            + (f"，已编入 wiki 会跳过 {skipped_consumed} 条" if skipped_consumed else "")
+            + (f"，待重试 {len(still_skipped)} 条" if still_skipped else "")
+        )
 
-    write_progress("done", synced=synced_ok, total=total)
+    write_progress("done", synced=written_ok + dry_run_ok, total=total)
 
 
 if __name__ == "__main__":
