@@ -4,3 +4,7 @@ __pycache__/
 
 # Local runtime state
 getnote-sync/scripts/.getnote_sync_state.json
+
+# arxivsub-skill local credentials and runtime cache
+arxivsub-skill/.env
+arxivsub-skill/tmp/
