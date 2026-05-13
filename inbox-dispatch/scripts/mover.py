@@ -25,6 +25,7 @@ import filecmp
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 
 from queue_config import VAULT, resolve_queue_destination, queue_by_name, pending_root_rel
 
@@ -32,6 +33,7 @@ GETNOTE_ASSET_DIR = VAULT / "00_Inbox" / "Get笔记" / "_assets" / "Get笔记"
 LOCAL_ASSETS_DIR_NAME = "assets"
 SPECIAL_CHARS = set('#^[]|*\\<>:?/')
 _last_attachment_ms = 0
+USE_OBSIDIAN_CLI = os.environ.get("INBOX_DISPATCH_USE_OBSIDIAN_CLI", "1").lower() not in {"0", "false", "no"}
 
 
 def parse_args():
@@ -166,6 +168,94 @@ def move_note_preserving_file_times(src, dest):
     return times
 
 
+def vault_relative(path):
+    return str(Path(path).relative_to(VAULT))
+
+
+def obsidian_cli_available():
+    return bool(shutil.which("obsidian"))
+
+
+def move_note_with_obsidian_cli(src, dest):
+    """Move a note through Obsidian so Custom Attachment Location handles assets.
+
+    The Obsidian CLI command calls into the running app. With the Custom
+    Attachment Location plugin enabled, this triggers the plugin's own
+    attachment move/rename logic. This is preferred over raw filesystem rename.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "obsidian",
+        f"vault={VAULT.name}",
+        "move",
+        f"path={vault_relative(src)}",
+        f"to={vault_relative(dest)}",
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=str(VAULT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"obsidian move failed ({result.returncode}): {details}")
+
+    # Obsidian/plug-in filesystem work is usually synchronous, but give it a
+    # short grace period before falling back to Python-level handling.
+    for _ in range(20):
+        if dest.exists() and not src.exists():
+            break
+        time.sleep(0.1)
+    if not dest.exists():
+        details = (result.stdout or result.stderr or "").strip()
+        raise RuntimeError(f"obsidian move did not create expected destination: {dest} ({details})")
+
+    # The Custom Attachment Location plugin may finish attachment rename/link
+    # updates shortly after the note file itself appears. Wait until all local
+    # assets referenced by the note exist at the destination before any fallback
+    # logic inspects the file.
+    for _ in range(50):
+        try:
+            text = dest.read_text(encoding="utf-8", errors="ignore")
+            refs = local_asset_refs_from_text(text)
+            missing = [
+                rel for rel in refs
+                if rel.startswith(f"{LOCAL_ASSETS_DIR_NAME}/")
+                and not (dest.parent / Path(unquote(rel))).exists()
+            ]
+            if not missing:
+                break
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return result.stdout.strip()
+
+
+def move_note(src, dest):
+    """Move note, preferring Obsidian CLI to trigger attachment plug-ins.
+
+    Returns: (original_times, method, warning)
+    """
+    times = capture_file_times(src)
+    if USE_OBSIDIAN_CLI and obsidian_cli_available():
+        try:
+            move_note_with_obsidian_cli(src, dest)
+            return times, "obsidian-cli", ""
+        except Exception as e:
+            # Fall back to Python so dispatch can still complete if Obsidian is
+            # closed or the CLI is temporarily unavailable; the safety fallback
+            # below moves known local assets itself.
+            warning = f"Obsidian CLI move failed; used Python fallback: {e}"
+            move_note_preserving_file_times(src, dest)
+            return times, "python-fallback", warning
+
+    move_note_preserving_file_times(src, dest)
+    return times, "python", ""
+
+
 def local_asset_refs_from_text(text):
     """Return vault-note-relative attachment paths beginning with assets/.
 
@@ -253,7 +343,7 @@ def process_local_attachments(src_md_path, dest_md_path):
 
     def move_by_rel(rel, count_missing=True):
         nonlocal moved, missing
-        rel_path = Path(rel)
+        rel_path = Path(unquote(rel))
         src_file = src_md_path.parent / rel_path
         dest_file = dest_md_path.parent / rel_path
         if src_file.exists() and src_file.is_file():
@@ -320,7 +410,7 @@ def process_getnote_attachments(md_path):
 
     def ensure_local(filename):
         nonlocal copied_count, missing_count
-        filename = Path(filename.strip()).name
+        filename = Path(unquote(filename.strip())).name
         local_asset_dir.mkdir(parents=True, exist_ok=True)
         src = GETNOTE_ASSET_DIR / filename
         if src.exists():
@@ -347,6 +437,22 @@ def process_getnote_attachments(md_path):
         return f'![{m.group(1)}](<{rel}>)'
 
     text = re.sub(r'!\[([^\]]*)\]\(_assets/Get笔记/([^\)]+)\)', repl_relative, text)
+
+    # Obsidian CLI may rewrite old central relative links after moving the note,
+    # e.g. ![](../../00_Inbox/Get笔记/_assets/Get笔记/x.jpg). Convert those too.
+    def repl_any_old_markdown_path(m):
+        nonlocal rewritten
+        rel = ensure_local(m.group(3))
+        if not rel:
+            return m.group(0)
+        rewritten += 1
+        return f'![{m.group(1)}](<{rel}>)'
+
+    text = re.sub(
+        r'!\[([^\]]*)\]\(<?([^\)\n>]*_assets/Get笔记/([^\)\n>]+))>?\)',
+        repl_any_old_markdown_path,
+        text,
+    )
 
     # Previous/absolute central wikilinks, if any: ![[00_Inbox/Get笔记/_assets/Get笔记/x.jpg]]
     def repl_central_wikilink(m):
@@ -442,6 +548,8 @@ def execute():
     total_missing_assets = 0
     total_time_restored = 0
     time_restore_warnings = []
+    move_method_counts = {}
+    move_warnings = []
     central_sources_for_cleanup = set()
 
     for item in dispatches:
@@ -480,7 +588,10 @@ def execute():
             print(f"[DRY-RUN] 将移动: {source_rel} -> {dest_rel}{suffix}")
         else:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            original_times = move_note_preserving_file_times(src, dest)
+            original_times, move_method, move_warning = move_note(src, dest)
+            move_method_counts[move_method] = move_method_counts.get(move_method, 0) + 1
+            if move_warning:
+                move_warnings.append(f"{source_rel}: {move_warning}")
             local_rewritten, local_moved, local_missing_assets = process_local_attachments(src, dest)
             central_rewritten, central_copied, central_missing_assets, central_sources = process_getnote_attachments(dest)
             time_restore_warnings.extend(restore_file_times(dest, original_times))
@@ -496,6 +607,8 @@ def execute():
                 extra_parts.append(f"图片迁移 {local_moved + central_copied} 个")
             if local_missing_assets + central_missing_assets:
                 extra_parts.append(f"缺失图片 {local_missing_assets + central_missing_assets} 个")
+            if move_method:
+                extra_parts.append(f"移动方式 {move_method}")
             extra = "；" + "，".join(extra_parts) if extra_parts else ""
             print(f"✅ 已移动: {source_rel} -> {dest_rel}{suffix}{extra}")
 
@@ -514,6 +627,12 @@ def execute():
         print(f"图片迁移到笔记本地 assets: {total_copied} 个")
         print(f"源目录缺失图片: {total_missing_assets} 个")
         print(f"已恢复笔记创建/修改时间: {total_time_restored} 条")
+        if move_method_counts:
+            print("移动方式: " + ", ".join(f"{k}={v}" for k, v in sorted(move_method_counts.items())))
+        if move_warnings:
+            print(f"移动方式警告: {len(move_warnings)} 条")
+            for warning in move_warnings[:5]:
+                print(f"  - {warning}")
         if time_restore_warnings:
             print(f"时间恢复警告: {len(time_restore_warnings)} 条")
             for warning in time_restore_warnings[:5]:
