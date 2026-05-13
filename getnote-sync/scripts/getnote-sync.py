@@ -54,7 +54,7 @@ BASE_URL = "https://openapi.biji.com"
 VAULT_DIR = os.path.expanduser("~/obsidian")
 OUT_DIR = os.path.join(VAULT_DIR, "00_Inbox", "Get笔记")
 AUDIO_OUT_DIR = os.path.join(VAULT_DIR, "00_Inbox", "音频")
-ASSETS_DIR = os.path.join(OUT_DIR, "_assets", "Get笔记")
+ATTACHMENTS_DIR_NAME = "assets"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".getnote_sync_state.json")
 PROGRESS_FILE = "/tmp/openclaw/getnote-sync-progress.json"
 
@@ -96,6 +96,7 @@ MAX_WORKERS = 4
 
 # 图片 URL 缓存（避免同一笔记重复下载）
 _url_cache = {}
+_last_attachment_ms = 0
 
 
 def log(msg):
@@ -362,35 +363,66 @@ def reconcile_state_with_vault(state, note_index):
     return state, changed, local_latest
 
 
-def download_image(url, note_id, idx, retries=3):
-    """下载图片，返回本地保存路径（相对 OUT_DIR 的路径）。"""
+def note_stem_from_path(note_filepath):
+    return os.path.splitext(os.path.basename(note_filepath))[0]
+
+
+def attachment_dir_for_note_path(note_filepath):
+    """Custom Attachment Location: ./assets/${noteFileName}."""
+    return os.path.join(
+        os.path.dirname(note_filepath),
+        ATTACHMENTS_DIR_NAME,
+        note_stem_from_path(note_filepath),
+    )
+
+
+def attachment_rel_dir_for_note_path(note_filepath):
+    """Relative markdown path from the note to its attachment directory."""
+    return os.path.join(ATTACHMENTS_DIR_NAME, note_stem_from_path(note_filepath))
+
+
+def next_attachment_basename(ext):
+    """Custom Attachment Location filename: file-YYYYMMDDHHmmssSSS."""
+    global _last_attachment_ms
+    current_ms = time.time_ns() // 1_000_000
+    if current_ms <= _last_attachment_ms:
+        current_ms = _last_attachment_ms + 1
+    _last_attachment_ms = current_ms
+    dt = datetime.fromtimestamp(current_ms / 1000, CST)
+    return f"file-{dt.strftime('%Y%m%d%H%M%S')}{current_ms % 1000:03d}{ext}"
+
+
+def image_ext_from_url(url):
+    lower = url.lower()
+    if ".jpeg" in lower or ".jpg" in lower:
+        return ".jpg"
+    if ".png" in lower:
+        return ".png"
+    if ".gif" in lower:
+        return ".gif"
+    if ".webp" in lower:
+        return ".webp"
+    return ".jpg"
+
+
+def download_image(url, note_filepath, retries=3):
+    """下载图片，返回相对当前笔记的本地路径：assets/${noteFileName}/file-*.ext。"""
     global _url_cache
-    cache_key = f"{note_id}:{idx}:{url}"
+    cache_key = f"{note_filepath}:{url}"
     if cache_key in _url_cache:
         return _url_cache[cache_key]
 
-    os.makedirs(ASSETS_DIR, exist_ok=True)
+    attachment_dir = attachment_dir_for_note_path(note_filepath)
+    rel_dir = attachment_rel_dir_for_note_path(note_filepath)
+    os.makedirs(attachment_dir, exist_ok=True)
 
-    lower = url.lower()
-    if ".jpeg" in lower or ".jpg" in lower:
-        ext = ".jpg"
-    elif ".png" in lower:
-        ext = ".png"
-    elif ".gif" in lower:
-        ext = ".gif"
-    elif ".webp" in lower:
-        ext = ".webp"
-    else:
-        ext = ".jpg"
-
-    safe_id = str(note_id) or "unknown"
-    local_filename = f"{safe_id}_{idx}{ext}"
-    local_path = os.path.join(ASSETS_DIR, local_filename)
-    rel_path = os.path.join("_assets", "Get笔记", local_filename)
-
-    if os.path.exists(local_path):
-        _url_cache[cache_key] = rel_path
-        return rel_path
+    ext = image_ext_from_url(url)
+    local_filename = next_attachment_basename(ext)
+    local_path = os.path.join(attachment_dir, local_filename)
+    while os.path.exists(local_path):
+        local_filename = next_attachment_basename(ext)
+        local_path = os.path.join(attachment_dir, local_filename)
+    rel_path = os.path.join(rel_dir, local_filename)
 
     for attempt in range(retries):
         try:
@@ -403,7 +435,7 @@ def download_image(url, note_id, idx, retries=3):
             with open(local_path, "wb") as f:
                 f.write(data)
             _url_cache[cache_key] = rel_path
-            log(f"    📷 下载图片: {local_filename} ({len(data)//1024}KB)")
+            log(f"    📷 下载图片: {rel_path} ({len(data)//1024}KB)")
             return rel_path
         except Exception as e:
             if attempt < retries - 1:
@@ -468,6 +500,8 @@ def replace_images_in_text(text, url_to_local_path):
     def replacer_md(m):
         url = m.group(1)
         local = url_to_local_path.get(url, url)
+        if local != url:
+            return f'![](<{local}>)'
         return f'![]({local})'
     text = re.sub(r'!\[.*?\]\((.*?)\)', replacer_md, text)
 
@@ -480,7 +514,7 @@ def replace_images_in_text(text, url_to_local_path):
     return text
 
 
-def download_and_replace_images(text, note_id):
+def download_and_replace_images(text, note_filepath):
     """下载文本中的所有图片，返回替换后的文本和图片路径列表。"""
     urls = extract_image_urls(text)
     if not urls:
@@ -488,8 +522,8 @@ def download_and_replace_images(text, note_id):
 
     url_to_path = {}
     paths = []
-    for idx, url in enumerate(urls):
-        path = download_image(url, note_id, idx)
+    for url in urls:
+        path = download_image(url, note_filepath)
         if path:
             url_to_path[url] = path
             paths.append(path)
@@ -560,7 +594,7 @@ def note_to_md(note, image_paths=None):
         for p in image_paths:
             if p:
                 lines.append("")
-                lines.append(f"![]({p})")
+                lines.append(f"![](<{p}>)")
 
     if web_url and note_type == "link":
         lines.append(f"\n🔗 [查看原文]({web_url})")
@@ -582,6 +616,11 @@ def write_note(note, out_dir, note_index):
     """
     note_id = str(note.get("note_id", note.get("id", ""))).strip()
     title = note.get("title", "无标题")
+
+    # 黑名单：用户明确排除的笔记
+    excluded_ids = getattr(write_note, "_excluded_ids", set())
+    if note_id and note_id in excluded_ids:
+        return "excluded", f"⏭️  跳过（黑名单）：{title}"
 
     if note_id and note_is_consumed(note_id, note_index):
         path = note_index[note_id]["consumed_paths"][0]
@@ -614,7 +653,7 @@ def write_note(note, out_dir, note_index):
             attachments = note.get("attachments", []) or []
             for idx, att in enumerate(attachments):
                 if att.get("type") == "image" and (att.get("original_url") or att.get("url")):
-                    p = download_image(att.get("original_url") or att.get("url"), note_id, idx)
+                    p = download_image(att.get("original_url") or att.get("url"), filepath)
                     if p:
                         image_paths.append(p)
 
@@ -623,7 +662,7 @@ def write_note(note, out_dir, note_index):
             web_page = note.get("web_page", {}) or {}
             if web_page.get("content"):
                 content_with_local_images, downloaded_paths = download_and_replace_images(
-                    web_page["content"], note_id
+                    web_page["content"], filepath
                 )
                 if downloaded_paths:
                     image_paths.extend(downloaded_paths)
@@ -632,7 +671,6 @@ def write_note(note, out_dir, note_index):
                     note["web_page"]["content"] = content_with_local_images
 
         os.makedirs(out_dir, exist_ok=True)
-        os.makedirs(ASSETS_DIR, exist_ok=True)
         md = note_to_md(note, image_paths)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(md)
@@ -763,8 +801,6 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(AUDIO_OUT_DIR, exist_ok=True)
-    if not DRY_RUN:
-        os.makedirs(ASSETS_DIR, exist_ok=True)
     write_progress("running", synced=0, total=0)
 
     sync_start_time = now_iso()
@@ -772,6 +808,7 @@ def main():
     note_index = build_note_index()
     state, reconciled, local_latest = reconcile_state_with_vault(original_state, note_index)
     skipped_ids = set(str(x) for x in (state.get("skipped_notes") or []) if x)
+    excluded_ids = set(str(x) for x in (state.get("excluded_notes") or []) if x)
     cutoff = None if FULL_SYNC else state.get("last_synced_at")
 
     if FULL_SYNC:
@@ -812,6 +849,9 @@ def main():
     skipped_consumed = 0
     still_skipped = set()
     new_max_created = None
+
+    # 注入黑名单到 write_note
+    write_note._excluded_ids = excluded_ids
 
     log(f"\n开始获取详情（并发数={MAX_WORKERS}）...")
     write_progress("fetching_details", synced=0, total=total)
@@ -854,6 +894,8 @@ def main():
                 log(f"  [{completed}/{total}] {message}")
             elif status == "existing":
                 skipped_existing += 1
+                log(f"  [{completed}/{total}] {message}")
+            elif status == "excluded":
                 log(f"  [{completed}/{total}] {message}")
             elif status == "consumed":
                 skipped_consumed += 1

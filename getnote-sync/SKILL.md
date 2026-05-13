@@ -32,7 +32,7 @@ python3 scripts/getnote-sync.py
 - 笔记文件：`~/obsidian/00_Inbox/Get笔记/`（Markdown 格式，含 frontmatter）
 - frontmatter 字段：`title`、`date`、`source`、`source_type`、`note_id`、`tags`（如有）、`url`（如有）
 - **录音笔记文件：`~/obsidian/00_Inbox/音频/`**（note_type 为 `recorder_audio` 的录音转写笔记）
-- 图片附件：`~/obsidian/00_Inbox/Get笔记/_assets/Get笔记/`
+- 图片附件：按 Custom Attachment Location 规则保存在笔记同目录的 `assets/${noteFileName}/file-YYYYMMDDHHmmssSSS.ext`
 - 同步状态：`scripts/.getnote_sync_state.json`
 - 进度文件：`/tmp/openclaw/getnote-sync-progress.json`
 
@@ -42,7 +42,7 @@ python3 scripts/getnote-sync.py
 - 去重保护：扫描 vault 中已有 `note_id`，已同步、已移动、已编入 wiki 的笔记不会再次落入 Inbox
 - 状态修复：如果状态文件落后于 vault 中已有笔记，会自动用本地最新 Get笔记日期修复水位
 - **录音笔记路由**：note_type 为 `recorder_audio` 的录音转写笔记自动写入 `00_Inbox/音频/`，其他类型写入 `00_Inbox/Get笔记/`
-- 图片下载：`img_text` 类型笔记自动下载图片附件并嵌入 markdown
+- 图片下载：`img_text` 和链接正文中的图片会按 `./assets/${noteFileName}/file-YYYYMMDDHHmmssSSS` 规则保存并嵌入 markdown
 - 429 限流自动重试
 - 并发下载图片（4 workers）
 - 音频笔记转写未完成时自动跳过
