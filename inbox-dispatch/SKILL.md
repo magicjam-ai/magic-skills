@@ -43,7 +43,7 @@ python3 scripts/list_queues.py --format markdown
 5. **疑似重复、浅层、营销进入 `trash_queue`。** 不要直接删除。
 6. **单批建议不超过 50 篇。** 大批量 Inbox 积压要分批处理。
 7. **跳过附件/素材类目录。** scanner 默认跳过 `_dispatch_logs`、`图片`、`素材`、`视频`、`论文`、`_assets`。
-8. **移动 Get笔记 Markdown 时必须同步处理图片。** `mover.py --execute` 会把 `![](_assets/Get笔记/xxx.jpg)` 引用到的图片复制到笔记同目录的 `assets/${noteFileName}/`，再把链接改写为 `![[assets/${noteFileName}/xxx.jpg]]`；确认没有旧引用后才清理 `00_Inbox/Get笔记/_assets/Get笔记/` 中的中央图片。
+8. **移动 Get笔记 Markdown 时必须同步处理图片。** `mover.py --execute` 是纯 Python 文件移动，不会触发 Obsidian 插件；因此它必须自己处理附件：对新规则 `![](<assets/${noteFileName}/file-YYYYMMDDHHmmssSSS.ext>)`，同步移动笔记同目录的 `assets/${noteFileName}/` 到目标目录；对旧规则 `![](_assets/Get笔记/xxx.jpg)`，复制到目标笔记同目录的 `assets/${noteFileName}/file-YYYYMMDDHHmmssSSS.ext` 并改写链接。确认没有旧引用后才清理 `00_Inbox/Get笔记/_assets/Get笔记/` 中的中央图片。
 9. **必须保留笔记原始时间。** `mover.py --execute` 移动 Markdown 时要保留原始创建时间和修改时间，避免 Robert 按创建时间从新到旧阅读时被分批移动顺序打乱。实现上优先使用同卷 `rename` 保留 inode；若发生 copy/delete fallback，则在 macOS 上用 `SetFile -d` 恢复 birthtime，并用 `os.utime` 恢复 atime/mtime。Get笔记图片链接改写后也必须恢复原笔记时间。
 10. **目标已存在时删除 Inbox 重复源。** 如果 plan 指向的目标目录下已经存在同名 Markdown，说明这篇 Inbox 笔记已被分拣过；`validate_plan.py` 只给 warning，不阻断执行；`mover.py --execute` 不再跳过，而是直接删除 `00_Inbox` 中的重复源笔记，并对其旧 Get笔记中央图片引用做安全清理检查。
 
